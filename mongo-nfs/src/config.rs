@@ -16,6 +16,9 @@ use clap::Parser;
     about = "export Mofu FileSystem as NFS server"
 )]
 pub(crate) struct AppArgs {
+    #[clap(long, env, default_value = "127.0.0.1")]
+    pub host: String,
+
     #[clap(short = 'p', long, env, default_value = "31128")]
     pub port: u16,
 

@@ -1,9 +1,17 @@
 use clap::Parser;
 use dotenvy::dotenv;
+use futures::{StreamExt, TryStreamExt};
+use nfsserve::tcp::{NFSTcp, NFSTcpListener};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::config::AppArgs;
+use crate::db::{MongoDB, MongoDBError};
+use crate::vfs::VFSMofuFS;
 
 pub mod config;
+mod db;
+mod vfs;
 
 #[tokio::main]
 async fn main() {
@@ -29,7 +37,22 @@ async fn mongo_nfs() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = config::Config::from_file(&args.config).await?;
 
-    tracing::info!("Mofu NFS server starting on port {}", args.port);
+    let db = Arc::new(
+        tokio_stream::iter(config.sources)
+            .map(|(k, v)| async move {
+                let db = MongoDB::new(k.clone(), &v.uri, &v.db).await;
+                (k, db)
+            })
+            .buffer_unordered(5)
+            .map(|(k, v)| Ok::<(String, MongoDB), MongoDBError>((k, v?)))
+            .try_collect::<BTreeMap<_, _>>()
+            .await?,
+    );
+
+    let listener =
+        NFSTcpListener::bind(&format!("{}:{}", args.host, args.port), VFSMofuFS {}).await?;
+
+    listener.handle_forever().await?;
 
     Ok(())
 }
