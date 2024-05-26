@@ -1,3 +1,4 @@
+use core::panic;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ use futures::StreamExt;
 use itertools::Itertools;
 use mongodb::bson::doc;
 use mongodb::bson::oid::ObjectId;
+use mongodb::bson::DateTime;
 use mongodb::options::FindOptions;
 use nfsserve::nfs::fattr3;
 use nfsserve::nfs::fileid3;
@@ -14,15 +16,12 @@ use nfsserve::nfs::filename3;
 use nfsserve::nfs::ftype3;
 use nfsserve::nfs::nfspath3;
 use nfsserve::nfs::nfsstat3;
-use nfsserve::nfs::nfsstring;
 use nfsserve::nfs::nfstime3;
 use nfsserve::nfs::sattr3;
 use nfsserve::nfs::specdata3;
 use nfsserve::vfs::DirEntry;
 use nfsserve::vfs::ReadDirResult;
 use nfsserve::vfs::{NFSFileSystem, VFSCapabilities};
-use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::ParallelBridge;
 use thiserror::Error;
 use tracing::error;
 use tracing::info;
@@ -30,6 +29,8 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::db::attribute::MofuAttribute;
+use crate::db::time::MongoNFSTime;
 use crate::db::MongoDB;
 use fileid::{FileId, FileIdMap};
 
@@ -190,6 +191,56 @@ impl VFSMofuFS {
         let end = query.next().await.is_none();
         Ok(ReadDirResult { end, entries })
     }
+
+    async fn mkdir_db(
+        &self,
+        db: &MongoDB,
+        parent: ObjectId,
+        fs_id: MountpointId,
+        name: String,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let id = ObjectId::new();
+        let doc = MofuAttribute {
+            _id: None,
+            parent,
+            name,
+            is_dir: true,
+            mode: 777,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            created_at: MongoNFSTime::now(),
+            modified_at: MongoNFSTime::now(),
+            accessed_at: MongoNFSTime::now(),
+            timestamp: DateTime::now(),
+        };
+
+        db.attributes.insert_one(&doc, None).await.map_err(|e| {
+            error!("failed: {:?}", e);
+            nfsstat3::NFS3ERR_IO
+        })?;
+        let id = self
+            .id_map
+            .get_fileid_or_insert(FileId::ObjectId(fs_id, id));
+        Ok((id, doc.fattr3(id)))
+    }
+
+    fn getdirectory_db(
+        &self,
+        dirid: fileid3,
+    ) -> Result<(MountpointId, MongoDB, ObjectId), Option<FileId>> {
+        match self.id_map.get_fileid(dirid) {
+            Some(FileId::FileSystemRoot(fsid)) => {
+                let mp = self.mountpoint.get(fsid);
+                Ok((fsid, mp.db.clone(), mp.bucket))
+            }
+            Some(FileId::ObjectId(fsid, id)) => {
+                let mp = self.mountpoint.get(fsid);
+                Ok((fsid, mp.db.clone(), id))
+            }
+            o => Err(o),
+        }
+    }
 }
 
 #[async_trait]
@@ -324,12 +375,27 @@ impl NFSFileSystem for VFSMofuFS {
     /// Makes a directory with the following attributes.
     /// If not supported dur to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+    #[instrument(name = "vfs/mkdir", skip_all, fields(dir = %dirid, dirname = %dirname))]
     async fn mkdir(
         &self,
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        todo!()
+        info!("mkdir",);
+        match self.id_map.get_fileid(dirid) {
+            Some(FileId::Root) => Err(nfsstat3::NFS3ERR_PERM),
+            Some(FileId::FileSystemRoot(fs_id)) => {
+                let name = String::from_utf8(dirname.0.clone()).unwrap();
+                let mp = self.mountpoint.get(fs_id);
+                self.mkdir_db(&mp.db, mp.bucket, fs_id, name).await
+            }
+            Some(FileId::ObjectId(fs_id, obj_id)) => {
+                let name = String::from_utf8(dirname.0.clone()).unwrap();
+                let mp = self.mountpoint.get(fs_id);
+                self.mkdir_db(&mp.db, obj_id, fs_id, name).await
+            }
+            None => Err(nfsstat3::NFS3ERR_NOENT),
+        }
     }
 
     /// Removes a file.
@@ -342,6 +408,7 @@ impl NFSFileSystem for VFSMofuFS {
     /// Removes a file.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+    #[instrument(name = "vfs/rename", skip_all, fields(from_dir = %from_dirid, from_filename = %from_filename, to_dir = %to_dirid, to_filename = %to_filename))]
     async fn rename(
         &self,
         from_dirid: fileid3,
@@ -349,7 +416,55 @@ impl NFSFileSystem for VFSMofuFS {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        todo!()
+        let from_dir = self.id_map.get_fileid(from_dirid);
+        let to_dir = self.id_map.get_fileid(to_dirid);
+
+        let (from_fsid, db, from_objid) = match self.getdirectory_db(from_dirid) {
+            Ok(o) => o,
+            Err(Some(FileId::Root)) => {
+                error!("cannot rename root. change mountpoint config instead.");
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+            Err(None) => return Err(nfsstat3::NFS3ERR_NOENT),
+            _ => panic!("Unexpected getdirectory_db result."),
+        };
+
+        let (to_fsid, _, to_objid) = match self.getdirectory_db(to_dirid) {
+            Ok(o) => o,
+            Err(Some(FileId::Root)) => {
+                error!("cannot rename root. change mountpoint config instead.");
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+            Err(None) => return Err(nfsstat3::NFS3ERR_NOENT),
+            _ => panic!("Unexpected getdirectory_db result."),
+        };
+
+        if from_fsid != to_fsid {
+            // TODO: Implement rename across filesystems
+            error!("rename across filesystems is currently not supported.");
+            return Err(nfsstat3::NFS3ERR_NOTSUPP);
+        }
+
+        db.attributes
+            .update_one(
+                doc! {
+                "parent": from_objid,
+                "name": String::from_utf8(from_filename.0.clone()).unwrap(),
+                },
+                doc! {
+                    "$set": {
+                        "parent": to_objid,
+                        "name": String::from_utf8(to_filename.0.clone()).unwrap(),
+                    }
+                },
+                None,
+            )
+            .await
+            .map_err(|e| {
+                error!("failed: {:?}", e);
+                nfsstat3::NFS3ERR_IO
+            })?;
+        Ok(())
     }
 
     /// Returns the contents of a directory with pagination.

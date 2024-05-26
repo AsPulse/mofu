@@ -7,6 +7,16 @@ pub struct MongoNFSTime {
     pub seconds: u32,
     pub nseconds: u32,
 }
+impl MongoNFSTime {
+    pub fn now() -> Self {
+        let now = std::time::SystemTime::now();
+        let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+        Self {
+            seconds: duration.as_secs() as u32,
+            nseconds: duration.subsec_nanos(),
+        }
+    }
+}
 impl From<nfstime3> for MongoNFSTime {
     fn from(t: nfstime3) -> Self {
         Self {
