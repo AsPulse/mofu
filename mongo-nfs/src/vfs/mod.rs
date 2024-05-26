@@ -2,7 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future;
+use futures::StreamExt;
 use itertools::Itertools;
+use mongodb::bson::doc;
+use mongodb::bson::oid::ObjectId;
+use mongodb::options::FindOptions;
 use nfsserve::nfs::fattr3;
 use nfsserve::nfs::fileid3;
 use nfsserve::nfs::filename3;
@@ -22,12 +27,14 @@ use thiserror::Error;
 use tracing::error;
 use tracing::info;
 use tracing::instrument;
+use tracing::warn;
 
 use crate::config::Config;
 use crate::db::MongoDB;
 use fileid::{FileId, FileIdMap};
 
 use self::mountpoint::MountPointInitializeError;
+use self::mountpoint::MountpointId;
 use self::mountpoint::MountpointMap;
 mod fileid;
 mod mountpoint;
@@ -84,6 +91,107 @@ fn generate_default_dir(id: fileid3) -> fattr3 {
     }
 }
 
+impl VFSMofuFS {
+    async fn lookup_db(
+        &self,
+        db: &MongoDB,
+        parent: ObjectId,
+        fs_id: MountpointId,
+        name: String,
+    ) -> Result<fileid3, nfsstat3> {
+        match db
+            .attributes
+            .find_one(
+                doc! {
+                    "parent": parent,
+                    "name": name,
+                },
+                None,
+            )
+            .await
+        {
+            Ok(Some(doc)) => Ok(self
+                .id_map
+                .get_fileid_or_insert(FileId::ObjectId(fs_id, doc._id.unwrap()))),
+            Ok(None) => Err(nfsstat3::NFS3ERR_NOENT),
+            Err(e) => {
+                error!("failed: {:?}", e);
+                Err(nfsstat3::NFS3ERR_IO)
+            }
+        }
+    }
+
+    async fn readdir_db(
+        &self,
+        db: &MongoDB,
+        parent: ObjectId,
+        fs_id: MountpointId,
+        start_after: Option<ObjectId>,
+        max_entries: usize,
+    ) -> Result<ReadDirResult, nfsstat3> {
+        let cursor = db
+            .attributes
+            .find(
+                doc! {
+                    "parent": parent,
+                },
+                FindOptions::builder()
+                    .sort(doc! {
+                        "timestamp": 1
+                    })
+                    .build(),
+            )
+            .await
+            .map_err(|e| {
+                error!("failed: {:?}", e);
+                nfsstat3::NFS3ERR_IO
+            })?;
+        let mut query = cursor.skip_while(|doc| {
+            future::ready(
+                doc.as_ref()
+                    .map(|doc| match start_after {
+                        Some(start_after) => doc._id.unwrap() != start_after,
+                        None => false,
+                    })
+                    .unwrap_or(false),
+            )
+        });
+
+        let mut entries = query
+            .by_ref()
+            .take(max_entries)
+            .map(|doc| {
+                doc.map(|doc| {
+                    let name = doc.name.clone().as_bytes().into();
+                    let fileid = self
+                        .id_map
+                        .get_fileid_or_insert(FileId::ObjectId(fs_id, doc._id.unwrap()));
+                    let attr = doc.fattr3(fileid);
+                    DirEntry { fileid, name, attr }
+                })
+                .map_err(|e| {
+                    error!("failed: {:?}", e);
+                    nfsstat3::NFS3ERR_IO
+                })
+            })
+            .collect::<Vec<Result<DirEntry, nfsstat3>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<DirEntry>, nfsstat3>>()?;
+
+        if let Some(FileId::ObjectId(_, id)) = entries
+            .first()
+            .and_then(|x| self.id_map.get_fileid(x.fileid))
+        {
+            if Some(id) == start_after {
+                entries.remove(0);
+            }
+        }
+        let end = query.next().await.is_none();
+        Ok(ReadDirResult { end, entries })
+    }
+}
+
 #[async_trait]
 impl NFSFileSystem for VFSMofuFS {
     fn root_dir(&self) -> fileid3 {
@@ -113,14 +221,21 @@ impl NFSFileSystem for VFSMofuFS {
                 }
             }
             Some(FileId::FileSystemRoot(fs_id)) => {
+                info!("looking fs_id: {:?}", fs_id);
                 if filename == ".." {
                     return Ok(self.root_dir());
                 }
-                // TODO:
-                error!("lookup not implemented for filesystem root.");
-                return Err(nfsstat3::NFS3ERR_NOENT);
+                let fs = self.mountpoint.get(fs_id);
+                self.lookup_db(&fs.db, fs.bucket, fs_id, filename).await
             }
-            Some(FileId::ObjectId(fs_id, obj_id)) => todo!(),
+            Some(FileId::ObjectId(fs_id, obj_id)) => {
+                info!("looking fs_id: {:?}", fs_id);
+                if filename == ".." {
+                    return Ok(self.root_dir());
+                }
+                let fs = self.mountpoint.get(fs_id);
+                self.lookup_db(&fs.db, obj_id, fs_id, filename).await
+            }
             None => Err(nfsstat3::NFS3ERR_NOENT),
         }
     }
@@ -131,7 +246,27 @@ impl NFSFileSystem for VFSMofuFS {
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         match self.id_map.get_fileid(id) {
             Some(FileId::Root) | Some(FileId::FileSystemRoot(_)) => Ok(generate_default_dir(id)),
-            Some(FileId::ObjectId(fs_id, obj_id)) => todo!(),
+            Some(FileId::ObjectId(fs_id, obj_id)) => {
+                let fs = self.mountpoint.get(fs_id);
+                match fs
+                    .db
+                    .attributes
+                    .find_one(
+                        doc! {
+                            "_id": obj_id,
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    Ok(Some(doc)) => Ok(doc.fattr3(id)),
+                    Ok(None) => Err(nfsstat3::NFS3ERR_NOENT),
+                    Err(e) => {
+                        error!("failed: {:?}", e);
+                        Err(nfsstat3::NFS3ERR_IO)
+                    }
+                }
+            }
             None => Err(nfsstat3::NFS3ERR_NOENT),
         }
     }
@@ -225,7 +360,7 @@ impl NFSFileSystem for VFSMofuFS {
     /// For instance if the directory has entry with ids [1,6,2,11,8,9]
     /// and start_after=6, readdir should returning 2,11,8,...
     //
-    #[instrument(name = "vfs/readdir", skip_all, fields(dir = %dirid))]
+    #[instrument(name = "vfs/readdir", skip_all, fields(dir = %dirid, start_after = %start_after))]
     async fn readdir(
         &self,
         dirid: fileid3,
@@ -234,7 +369,7 @@ impl NFSFileSystem for VFSMofuFS {
     ) -> Result<ReadDirResult, nfsstat3> {
         match self.id_map.get_fileid(dirid) {
             Some(FileId::Root) => {
-                let result = self
+                let mut original = self
                     .mountpoint
                     .id_map
                     .iter()
@@ -244,26 +379,47 @@ impl NFSFileSystem for VFSMofuFS {
                             self.id_map.get_u64(&FileId::FileSystemRoot(*id)).unwrap(),
                         )
                     })
-                    .skip_while(|&(_, id)| id <= start_after)
+                    .skip_while(|&(_, id)| id <= start_after);
+                let entries = original
+                    .by_ref()
                     .take(max_entries)
                     .map(|(name, id)| DirEntry {
                         fileid: id,
                         name: name.as_bytes().into(),
                         attr: generate_default_dir(id),
-                    });
-                let end = result.clone().next().is_none();
-                let entries = result.collect_vec();
+                    })
+                    .collect_vec();
+                let end = original.next().is_none();
                 Ok(ReadDirResult { end, entries })
             }
-            Some(FileId::FileSystemRoot(_)) => {
-                // TODO:
-                error!("readdir not implemented for filesystem root.");
-                Ok(ReadDirResult {
-                    end: true,
-                    entries: vec![],
-                })
+            Some(FileId::FileSystemRoot(fs_id)) => {
+                info!("reading fs_id: {:?}", dirid);
+                let id = if start_after == 0 {
+                    None
+                } else {
+                    match self.id_map.get_fileid(start_after) {
+                        Some(FileId::ObjectId(fs, id)) if fs == fs_id => Some(id),
+                        _ => None,
+                    }
+                };
+                let mp = self.mountpoint.get(fs_id);
+                self.readdir_db(&mp.db, mp.bucket, fs_id, id, max_entries)
+                    .await
             }
-            Some(FileId::ObjectId(fs_id, obj_id)) => todo!(),
+            Some(FileId::ObjectId(fs_id, obj_id)) => {
+                info!("reading fs_id: {:?}", fs_id);
+                let id = if start_after == 0 {
+                    None
+                } else {
+                    match self.id_map.get_fileid(start_after) {
+                        Some(FileId::ObjectId(fs, id)) if fs == fs_id => Some(id),
+                        _ => None,
+                    }
+                };
+                let mp = self.mountpoint.get(fs_id);
+                self.readdir_db(&mp.db, obj_id, fs_id, id, max_entries)
+                    .await
+            }
             None => Err(nfsstat3::NFS3ERR_NOENT),
         }
     }
@@ -271,18 +427,22 @@ impl NFSFileSystem for VFSMofuFS {
     /// Makes a symlink with the following attributes.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+    #[instrument(name = "vfs/symlink", skip_all, fields(dir = %_dirid, linkname = %_linkname, symlink = %_symlink))]
     async fn symlink(
         &self,
-        dirid: fileid3,
-        linkname: &filename3,
-        symlink: &nfspath3,
-        attr: &sattr3,
+        _dirid: fileid3,
+        _linkname: &filename3,
+        _symlink: &nfspath3,
+        _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        todo!()
+        warn!("symlink not supported");
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
     /// Reads a symlink
-    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
-        todo!()
+    #[instrument(name = "vfs/readlink", skip_all, fields(id = %_id))]
+    async fn readlink(&self, _id: fileid3) -> Result<nfspath3, nfsstat3> {
+        warn!("readlink not supported");
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 }
