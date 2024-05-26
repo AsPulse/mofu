@@ -3,24 +3,23 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { nixpkgs, rust-overlay, flake-utils, ... }:
+  outputs = { nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ rust-overlay.overlays.default ];
         pkgs = import nixpkgs {
-          inherit system overlays;
-        };
+	  inherit system;
+	};
       in {
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = [
-            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+          nativeBuildInputs = with pkgs; [
+            darwin.apple_sdk.frameworks.SystemConfiguration
+            libiconv
           ];
-          buildInputs = [
-            pkgs.rust-bin.stable.latest.default
+          buildInputs = with pkgs; [
+            rustup
           ];
           shellHook = ''
             exec $SHELL
