@@ -1,11 +1,22 @@
+use attribute::MofuAttribute;
 use mongodb::bson::doc;
 use thiserror::Error;
 use tracing::{info, instrument};
 
+use self::bucket::MofuBucket;
+
+pub mod attribute;
+pub mod bucket;
+pub mod time;
+
+#[derive(Clone)]
 pub(crate) struct MongoDB {
     source: String,
     pub client: mongodb::Client,
     pub db: mongodb::Database,
+
+    pub attributes: mongodb::Collection<MofuAttribute>,
+    pub buckets: mongodb::Collection<MofuBucket>,
 }
 
 #[derive(Error, Debug)]
@@ -26,6 +37,8 @@ impl MongoDB {
         let mongo = Self {
             source: source.clone(),
             client,
+            attributes: db.collection("attributes"),
+            buckets: db.collection("buckets"),
             db,
         };
         mongo

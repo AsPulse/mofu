@@ -78,7 +78,7 @@ impl Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct MountpointConfig {
-    pub path: PathBuf,
+    pub path: String,
     pub source: String,
     pub bucket: String,
 }
