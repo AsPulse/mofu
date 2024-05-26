@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -46,15 +47,27 @@ impl Config {
             .await
             .map_err(|e| ConfigFromFileError::FileCannotOpen(path.to_path_buf(), e))?;
 
-        let config: Config = serde_yaml::from_slice(&file)?;
+        let mut config: Config = serde_yaml::from_slice(&file)?;
 
-        for mountpoint in &config.mountpoints {
-            if !config.sources.contains_key(&mountpoint.source) {
-                return Err(ConfigFromFileError::MissingSourceDefinition(
-                    mountpoint.source.clone(),
-                ));
-            }
+        // Remove unused sources
+        config
+            .sources
+            .retain(|k, _| config.mountpoints.iter().any(|x| x.source == *k));
+
+        // Ensure that all mountpoints have a corresponding source
+        let missing_sources = config
+            .mountpoints
+            .iter()
+            .map(|x| x.source.clone())
+            .filter(|x| !config.sources.contains_key(x))
+            .collect_vec();
+        if !missing_sources.is_empty() {
+            return Err(ConfigFromFileError::MissingSourceDefinition(
+                missing_sources.join(", "),
+            ));
         }
+
+        // TODO: Ensure that all mountpoint is not under another mountpoint.
 
         Ok(config)
     }

@@ -27,7 +27,7 @@ async fn main() {
 async fn mongo_nfs() -> Result<(), Box<dyn std::error::Error>> {
     let args: AppArgs = AppArgs::parse();
 
-    config::Config::from_file(&args.config).await?;
+    let config = config::Config::from_file(&args.config).await?;
 
     tracing::info!("Mofu NFS server starting on port {}", args.port);
 
