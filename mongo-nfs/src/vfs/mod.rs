@@ -134,7 +134,7 @@ impl VFSMofuFS {
             .attributes
             .find(
                 match start_after {
-                    Some(o) => doc!{
+                    Some(o) => doc! {
                         "_id": {
                             "$gt": o,
                         },
@@ -142,7 +142,7 @@ impl VFSMofuFS {
                     },
                     None => doc! {
                         "parent": parent,
-                    }
+                    },
                 },
                 FindOptions::builder()
                     .sort(doc! {
@@ -216,22 +216,26 @@ impl VFSMofuFS {
         Ok((id, doc.fattr3(id)))
     }
 
-    fn getdirectory_db(
-        &self,
-        dirid: fileid3,
-    ) -> Result<(MountpointId, MongoDB, ObjectId), Option<FileId>> {
+    fn getdirectory_db(&self, dirid: fileid3) -> DbDirectory {
         match self.id_map.get_fileid(dirid) {
             Some(FileId::FileSystemRoot(fsid)) => {
                 let mp = self.mountpoint.get(fsid);
-                Ok((fsid, mp.db.clone(), mp.bucket))
+                DbDirectory::Found(fsid, mp.db.clone(), mp.bucket)
             }
             Some(FileId::ObjectId(fsid, id)) => {
                 let mp = self.mountpoint.get(fsid);
-                Ok((fsid, mp.db.clone(), id))
+                DbDirectory::Found(fsid, mp.db.clone(), id)
             }
-            o => Err(o),
+            Some(FileId::Root) => DbDirectory::Root,
+            None => DbDirectory::NotFound,
         }
     }
+}
+
+pub enum DbDirectory {
+    Found(MountpointId, MongoDB, ObjectId),
+    Root,
+    NotFound,
 }
 
 #[async_trait]
@@ -408,23 +412,21 @@ impl NFSFileSystem for VFSMofuFS {
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
         let (from_fsid, db, from_objid) = match self.getdirectory_db(from_dirid) {
-            Ok(o) => o,
-            Err(Some(FileId::Root)) => {
+            DbDirectory::Found(f, d, o) => (f, d, o),
+            DbDirectory::Root => {
                 error!("cannot rename root. change mountpoint config instead.");
                 return Err(nfsstat3::NFS3ERR_PERM);
             }
-            Err(None) => return Err(nfsstat3::NFS3ERR_NOENT),
-            _ => panic!("Unexpected getdirectory_db result."),
+            DbDirectory::NotFound => return Err(nfsstat3::NFS3ERR_NOENT),
         };
 
         let (to_fsid, _, to_objid) = match self.getdirectory_db(to_dirid) {
-            Ok(o) => o,
-            Err(Some(FileId::Root)) => {
+            DbDirectory::Found(f, d, o) => (f, d, o),
+            DbDirectory::Root => {
                 error!("cannot rename root. change mountpoint config instead.");
                 return Err(nfsstat3::NFS3ERR_PERM);
             }
-            Err(None) => return Err(nfsstat3::NFS3ERR_NOENT),
-            _ => panic!("Unexpected getdirectory_db result."),
+            DbDirectory::NotFound => return Err(nfsstat3::NFS3ERR_NOENT),
         };
 
         if from_fsid != to_fsid {
