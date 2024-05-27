@@ -130,16 +130,25 @@ impl VFSMofuFS {
         start_after: Option<ObjectId>,
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
-        let cursor = db
+        let mut cursor = db
             .attributes
             .find(
-                doc! {
-                    "parent": parent,
+                match start_after {
+                    Some(o) => doc!{
+                        "_id": {
+                            "$gt": o,
+                        },
+                        "parent": parent,
+                    },
+                    None => doc! {
+                        "parent": parent,
+                    }
                 },
                 FindOptions::builder()
                     .sort(doc! {
-                        "timestamp": 1
+                        "_id": 1
                     })
+                    .limit((max_entries as i64).saturating_add(3))
                     .build(),
             )
             .await
@@ -147,18 +156,8 @@ impl VFSMofuFS {
                 error!("failed: {:?}", e);
                 nfsstat3::NFS3ERR_IO
             })?;
-        let mut query = cursor.skip_while(|doc| {
-            future::ready(
-                doc.as_ref()
-                    .map(|doc| match start_after {
-                        Some(start_after) => doc._id.unwrap() != start_after,
-                        None => false,
-                    })
-                    .unwrap_or(false),
-            )
-        });
 
-        let mut entries = query
+        let entries = cursor
             .by_ref()
             .take(max_entries)
             .map(|doc| {
@@ -180,15 +179,7 @@ impl VFSMofuFS {
             .into_iter()
             .collect::<Result<Vec<DirEntry>, nfsstat3>>()?;
 
-        if let Some(FileId::ObjectId(_, id)) = entries
-            .first()
-            .and_then(|x| self.id_map.get_fileid(x.fileid))
-        {
-            if Some(id) == start_after {
-                entries.remove(0);
-            }
-        }
-        let end = query.next().await.is_none();
+        let end = cursor.next().await.is_none();
         Ok(ReadDirResult { end, entries })
     }
 
