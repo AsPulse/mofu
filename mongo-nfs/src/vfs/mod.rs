@@ -407,9 +407,6 @@ impl NFSFileSystem for VFSMofuFS {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        let from_dir = self.id_map.get_fileid(from_dirid);
-        let to_dir = self.id_map.get_fileid(to_dirid);
-
         let (from_fsid, db, from_objid) = match self.getdirectory_db(from_dirid) {
             Ok(o) => o,
             Err(Some(FileId::Root)) => {
