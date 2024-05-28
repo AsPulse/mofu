@@ -357,14 +357,47 @@ impl NFSFileSystem for VFSMofuFS {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
     #[instrument(name = "vfs/setattr", skip_all, fields(id = %id, setattr = ?setattr))]
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        warn!("setattr not supported");
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+        let (fsid, objid) = match self.id_map.get_fileid(id) {
+            Some(FileId::ObjectId(fsid, objid)) => (fsid, objid),
+            Some(FileId::FileSystemRoot(_)) | Some(FileId::Root) => {
+                error!("cannot write to root or filesystem root");
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+            _ => return Err(nfsstat3::NFS3ERR_NOENT),
+        };
+
+        let mp = self.mountpoint.get(fsid);
+        let result = mp
+            .db
+            .attributes
+            .find_one_and_update(
+                doc! {
+                    "_id": objid,
+                },
+                doc! {
+                    "$set": sattr3_doc(&setattr).map_err(|e| {
+                        error!("failed: {:?}", e);
+                        nfsstat3::NFS3ERR_IO
+                    })?
+                },
+                None,
+            )
+            .await
+            .map_err(|e| {
+                error!("failed: {:?}", e);
+                nfsstat3::NFS3ERR_IO
+            })?;
+        match result {
+            Some(doc) => Ok(doc.fattr3(id)),
+            None => Err(nfsstat3::NFS3ERR_NOENT),
+        }
     }
 
     /// Reads the contents of a file returning (bytes, EOF)
     /// Note that offset/count may go past the end of the file and that
     /// in that case, all bytes till the end of file are returned.
     /// EOF must be flagged if the end of the file is reached by the read.
+    #[instrument(name = "vfs/read", skip_all, fields(id = %id, offset = %offset, count = %count))]
     async fn read(
         &self,
         id: fileid3,

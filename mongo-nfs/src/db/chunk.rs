@@ -175,6 +175,34 @@ impl MofuAttribute {
                 }
             }
         }
+        let end_at = offset + data.len() as u64;
+        if self.size < end_at {
+            info!("updating size: {:?} -> {:?}", self.size, end_at);
+            let size = match i64::try_from(end_at) {
+                Ok(ivalue) => ivalue,
+                Err(_) => {
+                    error!("failed to update size, value is too large: {:?}", end_at);
+                    return Err(nfsstat3::NFS3ERR_IO);
+                }
+            };
+            db.attributes
+                .update_one(
+                    doc! {
+                        "_id": self_id
+                    },
+                    doc! {
+                        "$set": {
+                            "size": size,
+                        }
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    error!("failed: {:?}", e);
+                    nfsstat3::NFS3ERR_IO
+                })?;
+        }
 
         Ok(())
     }
