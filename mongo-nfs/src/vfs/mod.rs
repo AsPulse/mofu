@@ -1,5 +1,6 @@
 use core::panic;
 use std::collections::BTreeMap;
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,8 +9,12 @@ use futures::StreamExt;
 use itertools::Itertools;
 use mongodb::bson::doc;
 use mongodb::bson::oid::ObjectId;
+use mongodb::bson::to_bson;
 use mongodb::bson::DateTime;
+use mongodb::bson::Document;
+use mongodb::options::FindOneAndUpdateOptions;
 use mongodb::options::FindOptions;
+use mongodb::options::ReturnDocument;
 use nfsserve::nfs::fattr3;
 use nfsserve::nfs::fileid3;
 use nfsserve::nfs::filename3;
@@ -18,10 +23,17 @@ use nfsserve::nfs::nfspath3;
 use nfsserve::nfs::nfsstat3;
 use nfsserve::nfs::nfstime3;
 use nfsserve::nfs::sattr3;
+use nfsserve::nfs::set_atime;
+use nfsserve::nfs::set_gid3;
+use nfsserve::nfs::set_mode3;
+use nfsserve::nfs::set_mtime;
+use nfsserve::nfs::set_size3;
+use nfsserve::nfs::set_uid3;
 use nfsserve::nfs::specdata3;
 use nfsserve::vfs::DirEntry;
 use nfsserve::vfs::ReadDirResult;
 use nfsserve::vfs::{NFSFileSystem, VFSCapabilities};
+use serde::Serialize;
 use thiserror::Error;
 use tracing::error;
 use tracing::info;
@@ -30,6 +42,7 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::db::attribute::MofuAttribute;
+use crate::db::attribute::MofuPayload;
 use crate::db::time::MongoNFSTime;
 use crate::db::MongoDB;
 use fileid::{FileId, FileIdMap};
@@ -90,6 +103,61 @@ fn generate_default_dir(id: fileid3) -> fattr3 {
         mtime: nfstime3::default(),
         ctime: nfstime3::default(),
     }
+}
+
+fn to_bson_and_err<T: Serialize + Debug>(value: &T) -> Result<mongodb::bson::Bson, nfsstat3> {
+    match to_bson(value) {
+        Ok(bson) => Ok(bson),
+        Err(e) => {
+            error!("failed to serialize value {:?}: {:?}", value, e);
+            Err(nfsstat3::NFS3ERR_IO)
+        }
+    }
+}
+
+fn sattr3_doc(attr: &sattr3) -> Result<Document, mongodb::bson::ser::Error> {
+    let mut doc = doc! {};
+    if let set_mode3::mode(mode) = attr.mode {
+        doc.insert("mode", mode);
+    }
+    if let set_uid3::uid(uid) = attr.uid {
+        doc.insert("uid", uid);
+    }
+    if let set_gid3::gid(gid) = attr.gid {
+        doc.insert("gid", gid);
+    }
+    if let set_size3::size(size) = attr.size {
+        // https://docs.rs/bson/latest/src/bson/ser/serde.rs.html#221-228
+        let size = match i64::try_from(size) {
+            Ok(ivalue) => ivalue,
+            Err(_) => {
+                return Err(mongodb::bson::ser::Error::UnsignedIntegerExceededRange(
+                    size,
+                ))
+            }
+        };
+        doc.insert("size", size);
+    }
+    match attr.atime {
+        set_atime::DONT_CHANGE => {}
+        set_atime::SET_TO_SERVER_TIME => {
+            doc.insert("accessed_at", to_bson(&MongoNFSTime::now())?);
+        }
+        set_atime::SET_TO_CLIENT_TIME(time) => {
+            doc.insert("accessed_at", to_bson(&MongoNFSTime::from(time))?);
+        }
+    }
+    match attr.mtime {
+        set_mtime::DONT_CHANGE => {}
+        set_mtime::SET_TO_SERVER_TIME => {
+            doc.insert("modified_at", to_bson(&MongoNFSTime::now())?);
+        }
+        set_mtime::SET_TO_CLIENT_TIME(time) => {
+            doc.insert("modified_at", to_bson(&MongoNFSTime::from(time))?);
+        }
+    }
+
+    Ok(doc)
 }
 
 impl VFSMofuFS {
@@ -349,23 +417,147 @@ impl NFSFileSystem for VFSMofuFS {
     /// Creates a file with the following attributes.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+    #[instrument(name = "vfs/create", skip_all, fields(dir = %dirid, filename = %filename))]
     async fn create(
         &self,
         dirid: fileid3,
         filename: &filename3,
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        todo!()
+        let (fsid, db, id) = match self.getdirectory_db(dirid) {
+            DbDirectory::Found(f, d, o) => (f, d, o),
+            DbDirectory::Root => {
+                error!("cannot create file/directory in root. change mountpoint config instead.");
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+            DbDirectory::NotFound => return Err(nfsstat3::NFS3ERR_NOENT),
+        };
+        info!("creating file: {:?}", attr);
+
+        let query = doc! {
+            "name": String::from_utf8(filename.0.clone()).unwrap(),
+            "parent": id,
+        };
+
+        let sattr3 = sattr3_doc(&attr).map_err(|e| {
+            error!("failed: {:?}", e);
+            nfsstat3::NFS3ERR_IO
+        })?;
+
+        let mut insert = doc! {
+            "is_dir": false,
+            "payload": to_bson_and_err(&None::<MofuPayload>)?,
+            "created_at": to_bson_and_err(&MongoNFSTime::now())?, "timestamp": DateTime::now(),
+        };
+
+        if !sattr3.contains_key("uid") {
+            insert.insert("uid", 0);
+        }
+        if !sattr3.contains_key("gid") {
+            insert.insert("gid", 0);
+        }
+        if !sattr3.contains_key("mode") {
+            insert.insert("mode", 777);
+        }
+        if !sattr3.contains_key("size") {
+            insert.insert("size", 0);
+        }
+        if !sattr3.contains_key("accessed_at") {
+            insert.insert("accessed_at", to_bson_and_err(&MongoNFSTime::now())?);
+        }
+        if !sattr3.contains_key("modified_at") {
+            insert.insert("modified_at", to_bson_and_err(&MongoNFSTime::now())?);
+        }
+
+        let doc = doc! {
+            "$setOnInsert": insert,
+            "$set": sattr3,
+        };
+
+        let update = db
+            .attributes
+            .find_one_and_update(
+                query,
+                doc,
+                FindOneAndUpdateOptions::builder()
+                    .upsert(true)
+                    .return_document(ReturnDocument::After)
+                    .build(),
+            )
+            .await
+            .map_err(|e| {
+                error!("failed: {:?}", e);
+                nfsstat3::NFS3ERR_IO
+            })?
+            .ok_or_else(|| {
+                error!("failed to create file");
+                nfsstat3::NFS3ERR_IO
+            })?;
+
+        let id = update._id.unwrap();
+        let file_id = self.id_map.get_fileid_or_insert(FileId::ObjectId(fsid, id));
+        let attr = update.fattr3(file_id);
+
+        Ok((file_id, attr))
     }
 
     /// Creates a file if it does not already exist
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+    #[instrument(name = "vfs/create_exclusive", skip_all, fields(dir = %dirid, filename = %filename))]
     async fn create_exclusive(
         &self,
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        todo!()
+        info!("creating file");
+        let (fsid, db, id) = match self.getdirectory_db(dirid) {
+            DbDirectory::Found(f, d, o) => (f, d, o),
+            DbDirectory::Root => {
+                error!("cannot create file/directory in root. change mountpoint config instead.");
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+            DbDirectory::NotFound => return Err(nfsstat3::NFS3ERR_NOENT),
+        };
+
+        let attr = MofuAttribute {
+            _id: None,
+            parent: id,
+            name: String::from_utf8(filename.0.clone()).unwrap(),
+            payload: None,
+            is_dir: false,
+            mode: 777,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            created_at: MongoNFSTime::now(),
+            modified_at: MongoNFSTime::now(),
+            accessed_at: MongoNFSTime::now(),
+            timestamp: DateTime::now(),
+        };
+
+        let oid = db
+            .attributes
+            .insert_one(&attr, None)
+            .await
+            .map_err(|e| {
+                match *e.kind {
+                    // WARN: この判定手法があってるかわからん
+                    // (既にファイルが存在した場合のErrorKindが何になるか調べないと……)
+                    mongodb::error::ErrorKind::Write(_) => nfsstat3::NFS3ERR_EXIST,
+                    _ => {
+                        error!("failed: {:?}", e);
+                        nfsstat3::NFS3ERR_IO
+                    }
+                }
+            })?
+            .inserted_id
+            .as_object_id()
+            .unwrap();
+
+        let fileid = self
+            .id_map
+            .get_fileid_or_insert(FileId::ObjectId(fsid, oid));
+        Ok(fileid)
     }
 
     /// Makes a directory with the following attributes.

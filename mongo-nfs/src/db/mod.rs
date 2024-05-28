@@ -1,5 +1,7 @@
 use attribute::MofuAttribute;
 use mongodb::bson::doc;
+use mongodb::options::IndexOptions;
+use mongodb::IndexModel;
 use thiserror::Error;
 use tracing::{info, instrument};
 
@@ -23,6 +25,9 @@ pub(crate) struct MongoDB {
 pub enum MongoDBError {
     #[error("failed to connect to MongoDB ({0})")]
     ConnectionFailed(String, mongodb::error::Error),
+
+    #[error("an error occured during creating index: {1} ({0})")]
+    IndexCreationFailed(String, mongodb::error::Error),
 }
 
 impl MongoDB {
@@ -53,6 +58,24 @@ impl MongoDB {
             .map_err(|e| MongoDBError::ConnectionFailed(source.clone(), e))?;
 
         info!("got ping response from MongoDB");
+
+        mongo
+            .attributes
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {
+                        "parent": 1,
+                        "name": 1
+                    })
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+                None,
+            )
+            .await
+            .map_err(|e| MongoDBError::IndexCreationFailed(source.clone(), e))?;
+
+        info!("created index for attributes collection");
+
         Ok(mongo)
     }
 }
