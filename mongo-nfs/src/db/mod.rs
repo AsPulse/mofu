@@ -6,9 +6,11 @@ use thiserror::Error;
 use tracing::{info, instrument};
 
 use self::bucket::MofuBucket;
+use self::chunk::MofuChunk;
 
 pub mod attribute;
 pub mod bucket;
+pub mod chunk;
 pub mod time;
 
 #[derive(Clone)]
@@ -19,6 +21,7 @@ pub(crate) struct MongoDB {
 
     pub attributes: mongodb::Collection<MofuAttribute>,
     pub buckets: mongodb::Collection<MofuBucket>,
+    pub chunks: mongodb::Collection<MofuChunk>,
 }
 
 #[derive(Error, Debug)]
@@ -44,6 +47,7 @@ impl MongoDB {
             client,
             attributes: db.collection("attributes"),
             buckets: db.collection("buckets"),
+            chunks: db.collection("chunks"),
             db,
         };
         mongo
@@ -75,6 +79,23 @@ impl MongoDB {
             .map_err(|e| MongoDBError::IndexCreationFailed(source.clone(), e))?;
 
         info!("created index for attributes collection");
+
+        mongo
+            .chunks
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! {
+                        "file": 1,
+                        "index": 1
+                    })
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+                None,
+            )
+            .await
+            .map_err(|e| MongoDBError::IndexCreationFailed(source.clone(), e))?;
+
+        info!("created index for chunks collection");
 
         Ok(mongo)
     }
