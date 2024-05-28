@@ -14,7 +14,6 @@ use nfsserve::nfs::{
     set_mode3, set_mtime, set_size3,
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
-use serde::Serialize;
 use thiserror::Error;
 use tracing::{error, info, instrument, warn};
 
@@ -440,7 +439,7 @@ impl NFSFileSystem for VFSMofuFS {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
 
-        Ok(attr.read_chunk(mp.db.clone(), offset, count).await?)
+        Ok(attr.read_chunk(&mp.db, offset, count).await?)
     }
 
     /// Writes the contents of a file returning (bytes, EOF)
@@ -485,8 +484,7 @@ impl NFSFileSystem for VFSMofuFS {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
 
-        attr.write_chunk(mp.db.clone(), offset, data.to_vec())
-            .await?;
+        attr.write_chunk(&mp.db, offset, data.to_vec()).await?;
 
         Ok(attr.fattr3(id))
     }

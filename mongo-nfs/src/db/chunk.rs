@@ -146,12 +146,12 @@ impl MofuAttribute {
 
     pub async fn read_chunk(
         &self,
-        db: MongoDB,
+        db: &MongoDB,
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let self_id = self._id.expect("self._id is None when writing to chunks");
-        match self.payload(&db).await? {
+        match self.payload(db).await? {
             MofuPayload::InternalChunk { buffer_kb } => {
                 let chunk_size = buffer_kb as u64 * KB_TO_BYTES;
 
@@ -211,13 +211,13 @@ impl MofuAttribute {
 
     pub async fn write_chunk(
         &self,
-        db: MongoDB,
+        db: &MongoDB,
         offset: u64,
         data: Vec<u8>,
     ) -> Result<(), nfsstat3> {
         assert!(!self.is_dir);
         let self_id = self._id.expect("self._id is None when writing to chunks");
-        match self.payload(&db).await? {
+        match self.payload(db).await? {
             MofuPayload::InternalChunk { buffer_kb } => {
                 let chunk_size = buffer_kb as u64 * KB_TO_BYTES;
 
