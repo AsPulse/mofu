@@ -666,8 +666,50 @@ impl NFSFileSystem for VFSMofuFS {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     #[instrument(name = "vfs/remove", skip_all, fields(dir = %dirid, filename = %filename))]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        warn!("remove not supported");
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+        info!("removing file");
+        let (_, db, id) = match self.getdirectory_db(dirid) {
+            DbDirectory::Found(f, d, o) => (f, d, o),
+            DbDirectory::Root => {
+                error!("cannot remove root. change mountpoint config instead.");
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+            DbDirectory::NotFound => return Err(nfsstat3::NFS3ERR_NOENT),
+        };
+
+        let attr = db
+            .attributes
+            .find_one_and_delete(
+                doc! {
+                    "parent": id,
+                    "name": String::from_utf8(filename.0.clone()).unwrap(),
+                },
+                None,
+            )
+            .await
+            .map_err(|e| {
+                error!("failed: {:?}", e);
+                nfsstat3::NFS3ERR_IO
+            })?
+            .ok_or_else(|| {
+                warn!("file not found");
+                nfsstat3::NFS3ERR_NOENT
+            })?;
+
+        if !attr.is_dir {
+            db.chunks
+                .delete_many(
+                    doc! {
+                        "file": attr._id.unwrap(),
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    error!("failed: {:?}", e);
+                    nfsstat3::NFS3ERR_IO
+                })?;
+        }
+        Ok(())
     }
 
     /// Removes a file.
