@@ -195,6 +195,7 @@ impl VFSMofuFS {
             _id: None,
             parent,
             name,
+            payload: None,
             is_dir: true,
             mode: 777,
             uid: 0,

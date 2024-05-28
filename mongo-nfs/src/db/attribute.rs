@@ -12,6 +12,7 @@ pub(crate) struct MofuAttribute {
     pub parent: ObjectId,
     pub name: String,
     pub is_dir: bool,
+    pub payload: Option<MofuPayload>,
     pub uid: uid3,
     pub gid: gid3,
     pub mode: mode3,
@@ -20,6 +21,14 @@ pub(crate) struct MofuAttribute {
     pub modified_at: MongoNFSTime,
     pub created_at: MongoNFSTime,
     pub timestamp: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum MofuPayload {
+    InternalChunk {
+        buffer_kb: u16,
+    },
 }
 
 impl MofuAttribute {
