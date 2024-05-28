@@ -404,7 +404,43 @@ impl NFSFileSystem for VFSMofuFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        todo!()
+        info!("reading file");
+        let (fsid, objid) = match self.id_map.get_fileid(id) {
+            Some(FileId::ObjectId(fsid, objid)) => (fsid, objid),
+            Some(FileId::FileSystemRoot(_)) | Some(FileId::Root) => {
+                error!("cannot read  root or filesystem root");
+                return Err(nfsstat3::NFS3ERR_PERM);
+            }
+            _ => return Err(nfsstat3::NFS3ERR_NOENT),
+        };
+
+        let mp = self.mountpoint.get(fsid);
+
+        let attr = mp
+            .db
+            .attributes
+            .find_one(
+                doc! {
+                    "_id": objid,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| {
+                error!("failed: {:?}", e);
+                nfsstat3::NFS3ERR_IO
+            })?
+            .ok_or_else(|| {
+                warn!("file not found");
+                nfsstat3::NFS3ERR_NOENT
+            })?;
+
+        if attr.is_dir {
+            warn!("attempted to write to a directory");
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+
+        Ok(attr.read_chunk(mp.db.clone(), offset, count).await?)
     }
 
     /// Writes the contents of a file returning (bytes, EOF)

@@ -1,7 +1,7 @@
 use std::ops::RangeBounds;
 
 use mongodb::bson::spec::BinarySubtype;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use mongodb::bson::oid::ObjectId;
 use mongodb::bson::{doc, Binary, Bson, DateTime};
@@ -115,19 +115,13 @@ async fn write_single_chunk<R: RangeBounds<usize>>(
 }
 
 impl MofuAttribute {
-    pub async fn write_chunk(
-        &self,
-        db: MongoDB,
-        offset: u64,
-        data: Vec<u8>,
-    ) -> Result<(), nfsstat3> {
-        assert!(!self.is_dir);
+    pub async fn payload(&self, db: &MongoDB) -> Result<MofuPayload, nfsstat3> {
         let self_id = self._id.expect("self._id is None when writing to chunks");
-        let payload = match self.payload.clone() {
+        Ok(match self.payload.clone() {
             Some(p) => p,
             None => {
                 let payload = MofuPayload::InternalChunk { buffer_kb: 1024 };
-                info!("payload is None, creating new chunk: {:?}", payload);
+                warn!("payload is None, creating new PayloadConfig: {:?}", payload);
                 db.attributes
                     .update_one(
                         doc! {
@@ -147,9 +141,83 @@ impl MofuAttribute {
                     })?;
                 payload
             }
-        };
+        })
+    }
 
-        match payload {
+    pub async fn read_chunk(
+        &self,
+        db: MongoDB,
+        offset: u64,
+        count: u32,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let self_id = self._id.expect("self._id is None when writing to chunks");
+        match self.payload(&db).await? {
+            MofuPayload::InternalChunk { buffer_kb } => {
+                let chunk_size = buffer_kb as u64 * KB_TO_BYTES;
+
+                let start_idx = u32::try_from(offset / chunk_size).unwrap();
+                let start_pos = usize::try_from(offset % chunk_size).unwrap();
+
+                let len = u32::try_from((count as u64).min(self.size - offset)).unwrap();
+                let end_idx = u32::try_from((offset + len as u64 - 1) / chunk_size).unwrap();
+                let end_pos = usize::try_from((offset + len as u64 - 1) % chunk_size).unwrap();
+
+                let mut data = Vec::new();
+                for i in start_idx..=end_idx {
+                    let range = if i == start_idx && i == end_idx {
+                        start_pos..=end_pos
+                    } else if i == start_idx {
+                        start_pos..=(chunk_size as usize - 1)
+                    } else if i == end_idx {
+                        0..=end_pos
+                    } else {
+                        0..=(chunk_size as usize - 1)
+                    };
+                    let chunk = db
+                        .chunks
+                        .find_one(
+                            doc! {
+                                "file": self_id,
+                                "index": i
+                            },
+                            None,
+                        )
+                        .await
+                        .map_err(|e| {
+                            error!("failed: {:?}", e);
+                            nfsstat3::NFS3ERR_IO
+                        })?;
+                    match chunk {
+                        Some(c) => {
+                            let payload = match c.payload {
+                                Bson::Binary(b) => b.bytes,
+                                _ => {
+                                    error!("payload is not Binary");
+                                    return Err(nfsstat3::NFS3ERR_IO);
+                                }
+                            };
+                            data.extend(payload[range].iter().cloned());
+                        }
+                        None => {
+                            error!("chunk not found: {:?}", i);
+                            return Err(nfsstat3::NFS3ERR_IO);
+                        }
+                    }
+                }
+                Ok((data, count as u64 >= self.size - offset))
+            }
+        }
+    }
+
+    pub async fn write_chunk(
+        &self,
+        db: MongoDB,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), nfsstat3> {
+        assert!(!self.is_dir);
+        let self_id = self._id.expect("self._id is None when writing to chunks");
+        match self.payload(&db).await? {
             MofuPayload::InternalChunk { buffer_kb } => {
                 let chunk_size = buffer_kb as u64 * KB_TO_BYTES;
 
