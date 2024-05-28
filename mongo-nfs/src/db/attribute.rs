@@ -26,9 +26,7 @@ pub(crate) struct MofuAttribute {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub(crate) enum MofuPayload {
-    InternalChunk {
-        buffer_kb: u16,
-    },
+    InternalChunk { buffer_kb: u16 },
 }
 
 impl MofuAttribute {

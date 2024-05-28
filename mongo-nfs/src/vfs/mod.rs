@@ -5,49 +5,28 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use itertools::Itertools;
-use mongodb::bson::doc;
-use mongodb::bson::oid::ObjectId;
-use mongodb::bson::to_bson;
-use mongodb::bson::DateTime;
-use mongodb::bson::Document;
-use mongodb::options::FindOneAndUpdateOptions;
-use mongodb::options::FindOptions;
-use mongodb::options::ReturnDocument;
-use nfsserve::nfs::fattr3;
-use nfsserve::nfs::fileid3;
-use nfsserve::nfs::filename3;
-use nfsserve::nfs::ftype3;
-use nfsserve::nfs::nfspath3;
-use nfsserve::nfs::nfsstat3;
-use nfsserve::nfs::nfstime3;
-use nfsserve::nfs::sattr3;
-use nfsserve::nfs::set_atime;
-use nfsserve::nfs::set_gid3;
-use nfsserve::nfs::set_mode3;
-use nfsserve::nfs::set_mtime;
-use nfsserve::nfs::set_size3;
+use mongodb::bson::{doc, oid::ObjectId, to_bson, DateTime, Document};
+use mongodb::options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument};
 use nfsserve::nfs::set_uid3;
 use nfsserve::nfs::specdata3;
-use nfsserve::vfs::DirEntry;
-use nfsserve::vfs::ReadDirResult;
-use nfsserve::vfs::{NFSFileSystem, VFSCapabilities};
+use nfsserve::nfs::{
+    fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, set_atime, set_gid3,
+    set_mode3, set_mtime, set_size3,
+};
+use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use serde::Serialize;
 use thiserror::Error;
-use tracing::error;
-use tracing::info;
-use tracing::instrument;
-use tracing::warn;
+use tracing::{error, info, instrument, warn};
 
 use crate::config::Config;
 use crate::db::attribute::MofuAttribute;
 use crate::db::attribute::MofuPayload;
 use crate::db::time::MongoNFSTime;
+use crate::db::util::to_bson_and_err;
 use crate::db::MongoDB;
 use fileid::{FileId, FileIdMap};
 
-use self::mountpoint::MountPointInitializeError;
-use self::mountpoint::MountpointId;
-use self::mountpoint::MountpointMap;
+use self::mountpoint::{MountPointInitializeError, MountpointId, MountpointMap};
 mod fileid;
 mod mountpoint;
 
@@ -100,16 +79,6 @@ fn generate_default_dir(id: fileid3) -> fattr3 {
         atime: nfstime3::default(),
         mtime: nfstime3::default(),
         ctime: nfstime3::default(),
-    }
-}
-
-fn to_bson_and_err<T: Serialize + Debug>(value: &T) -> Result<mongodb::bson::Bson, nfsstat3> {
-    match to_bson(value) {
-        Ok(bson) => Ok(bson),
-        Err(e) => {
-            error!("failed to serialize value {:?}: {:?}", value, e);
-            Err(nfsstat3::NFS3ERR_IO)
-        }
     }
 }
 
@@ -386,8 +355,10 @@ impl NFSFileSystem for VFSMofuFS {
 
     /// Sets the attributes of an id
     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
+    #[instrument(name = "vfs/setattr", skip_all, fields(id = %id, setattr = ?setattr))]
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
-        todo!()
+        warn!("setattr not supported");
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
     /// Reads the contents of a file returning (bytes, EOF)
@@ -445,7 +416,10 @@ impl NFSFileSystem for VFSMofuFS {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
 
-        todo!()
+        attr.write_chunk(mp.db.clone(), offset, data.to_vec())
+            .await?;
+
+        Ok(attr.fattr3(id))
     }
 
     /// Creates a file with the following attributes.
@@ -623,8 +597,10 @@ impl NFSFileSystem for VFSMofuFS {
     /// Removes a file.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
+    #[instrument(name = "vfs/remove", skip_all, fields(dir = %dirid, filename = %filename))]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        todo!()
+        warn!("remove not supported");
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 
     /// Removes a file.

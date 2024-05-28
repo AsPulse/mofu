@@ -12,6 +12,7 @@ pub mod attribute;
 pub mod bucket;
 pub mod chunk;
 pub mod time;
+pub mod util;
 
 #[derive(Clone)]
 pub(crate) struct MongoDB {
