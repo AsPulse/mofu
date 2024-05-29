@@ -18,7 +18,7 @@ pub(crate) struct MountpointMap {
 }
 
 pub(crate) struct Mountpoint {
-    pub db: MongoDB,
+    pub db: Arc<MongoDB>,
     pub bucket: ObjectId,
 }
 
@@ -33,7 +33,7 @@ pub enum MountPointInitializeError {
 impl MountpointMap {
     pub async fn new(
         config: &Config,
-        db: &Arc<BTreeMap<String, MongoDB>>,
+        db: &Arc<BTreeMap<String, Arc<MongoDB>>>,
     ) -> Result<Self, MountPointInitializeError> {
         let mut id_map = BiHashMap::new();
         let mut map = BTreeMap::new();
@@ -52,7 +52,7 @@ impl MountpointMap {
 }
 impl Mountpoint {
     #[instrument(name = "mountpoint/new", skip(db))]
-    pub async fn new(db: MongoDB, bucket: String) -> Result<Self, MountPointInitializeError> {
+    pub async fn new(db: Arc<MongoDB>, bucket: String) -> Result<Self, MountPointInitializeError> {
         let docs = db
             .buckets
             .find_one(

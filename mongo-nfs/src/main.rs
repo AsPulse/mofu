@@ -45,7 +45,7 @@ async fn mongo_nfs() -> Result<(), Box<dyn std::error::Error>> {
                 (k, db)
             })
             .buffer_unordered(5)
-            .map(|(k, v)| Ok::<(String, MongoDB), MongoDBError>((k.to_string(), v?)))
+            .map(|(k, v)| Ok::<(String, Arc<MongoDB>), MongoDBError>((k.to_string(), Arc::new(v?))))
             .try_collect::<BTreeMap<_, _>>()
             .await?,
     );

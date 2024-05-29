@@ -31,7 +31,7 @@ mod mountpoint;
 
 pub struct VFSMofuFS {
     pub config: Config,
-    pub db: Arc<BTreeMap<String, MongoDB>>,
+    pub db: Arc<BTreeMap<String, Arc<MongoDB>>>,
     id_map: FileIdMap,
     mountpoint: MountpointMap,
 }
@@ -45,7 +45,7 @@ pub enum MofuInitializeError {
 impl VFSMofuFS {
     pub async fn new(
         config: Config,
-        db: Arc<BTreeMap<String, MongoDB>>,
+        db: Arc<BTreeMap<String, Arc<MongoDB>>>,
     ) -> Result<Self, MofuInitializeError> {
         let id_map = FileIdMap::new();
         id_map.insert(FileId::Root);
@@ -268,7 +268,7 @@ impl VFSMofuFS {
 }
 
 pub enum DbDirectory {
-    Found(MountpointId, MongoDB, ObjectId),
+    Found(MountpointId, Arc<MongoDB>, ObjectId),
     Root,
     NotFound,
 }
@@ -439,7 +439,7 @@ impl NFSFileSystem for VFSMofuFS {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
 
-        Ok(attr.read_chunk(&mp.db, offset, count).await?)
+        todo!()
     }
 
     /// Writes the contents of a file returning (bytes, EOF)
@@ -484,7 +484,7 @@ impl NFSFileSystem for VFSMofuFS {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         }
 
-        attr.write_chunk(&mp.db, offset, data.to_vec()).await?;
+        todo!();
 
         Ok(attr.fattr3(id))
     }
