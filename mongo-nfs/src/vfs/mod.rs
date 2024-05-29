@@ -15,18 +15,21 @@ use nfsserve::nfs::{
 };
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use thiserror::Error;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, instrument, warn};
 
 use crate::config::Config;
 use crate::db::attribute::MofuAttribute;
 use crate::db::attribute::MofuPayload;
 use crate::db::time::MongoNFSTime;
-use crate::db::util::to_bson_and_err;
+use crate::db::util::{to_bson_and_err, u64_to_bson_and_err};
 use crate::db::MongoDB;
 use fileid::{FileId, FileIdMap};
 
+use self::mongorw::{run_mongorw, MongoRw};
 use self::mountpoint::{MountPointInitializeError, MountpointId, MountpointMap};
 mod fileid;
+pub mod mongorw;
 mod mountpoint;
 
 pub struct VFSMofuFS {
@@ -34,6 +37,7 @@ pub struct VFSMofuFS {
     pub db: Arc<BTreeMap<String, Arc<MongoDB>>>,
     id_map: FileIdMap,
     mountpoint: MountpointMap,
+    tx_mongorw: mpsc::Sender<MongoRw>,
 }
 
 #[derive(Error, Debug)]
@@ -59,6 +63,7 @@ impl VFSMofuFS {
             config,
             db,
             id_map,
+            tx_mongorw: run_mongorw().await,
         })
     }
 }
@@ -81,7 +86,7 @@ fn generate_default_dir(id: fileid3) -> fattr3 {
     }
 }
 
-fn sattr3_doc(attr: &sattr3) -> Result<Document, mongodb::bson::ser::Error> {
+fn sattr3_doc(attr: &sattr3) -> Result<Document, nfsstat3> {
     let mut doc = doc! {};
     if let set_mode3::mode(mode) = attr.mode {
         doc.insert("mode", mode);
@@ -93,33 +98,24 @@ fn sattr3_doc(attr: &sattr3) -> Result<Document, mongodb::bson::ser::Error> {
         doc.insert("gid", gid);
     }
     if let set_size3::size(size) = attr.size {
-        // https://docs.rs/bson/latest/src/bson/ser/serde.rs.html#221-228
-        let size = match i64::try_from(size) {
-            Ok(ivalue) => ivalue,
-            Err(_) => {
-                return Err(mongodb::bson::ser::Error::UnsignedIntegerExceededRange(
-                    size,
-                ))
-            }
-        };
-        doc.insert("size", size);
+        doc.insert("size", u64_to_bson_and_err(size)?);
     }
     match attr.atime {
         set_atime::DONT_CHANGE => {}
         set_atime::SET_TO_SERVER_TIME => {
-            doc.insert("accessed_at", to_bson(&MongoNFSTime::now())?);
+            doc.insert("accessed_at", to_bson_and_err(&MongoNFSTime::now())?);
         }
         set_atime::SET_TO_CLIENT_TIME(time) => {
-            doc.insert("accessed_at", to_bson(&MongoNFSTime::from(time))?);
+            doc.insert("accessed_at", to_bson_and_err(&MongoNFSTime::from(time))?);
         }
     }
     match attr.mtime {
         set_mtime::DONT_CHANGE => {}
         set_mtime::SET_TO_SERVER_TIME => {
-            doc.insert("modified_at", to_bson(&MongoNFSTime::now())?);
+            doc.insert("modified_at", to_bson_and_err(&MongoNFSTime::now())?);
         }
         set_mtime::SET_TO_CLIENT_TIME(time) => {
-            doc.insert("modified_at", to_bson(&MongoNFSTime::from(time))?);
+            doc.insert("modified_at", to_bson_and_err(&MongoNFSTime::from(time))?);
         }
     }
 
@@ -374,10 +370,7 @@ impl NFSFileSystem for VFSMofuFS {
                     "_id": objid,
                 },
                 doc! {
-                    "$set": sattr3_doc(&setattr).map_err(|e| {
-                        error!("failed: {:?}", e);
-                        nfsstat3::NFS3ERR_IO
-                    })?
+                    "$set": sattr3_doc(&setattr)?
                 },
                 None,
             )
@@ -459,34 +452,27 @@ impl NFSFileSystem for VFSMofuFS {
         };
 
         let mp = self.mountpoint.get(fsid);
-
-        let attr = mp
-            .db
-            .attributes
-            .find_one(
-                doc! {
-                    "_id": objid,
-                },
-                None,
-            )
+        let (tx, rx) = oneshot::channel();
+        self.tx_mongorw
+            .send(MongoRw::Write {
+                object_id: objid,
+                db: mp.db.clone(),
+                offset,
+                data: data.to_vec(),
+                reply: tx,
+            })
             .await
             .map_err(|e| {
                 error!("failed: {:?}", e);
                 nfsstat3::NFS3ERR_IO
-            })?
-            .ok_or_else(|| {
-                warn!("file not found");
-                nfsstat3::NFS3ERR_NOENT
             })?;
 
-        if attr.is_dir {
-            warn!("attempted to write to a directory");
-            return Err(nfsstat3::NFS3ERR_ISDIR);
-        }
-
-        todo!();
-
-        Ok(attr.fattr3(id))
+        rx.await
+            .map_err(|e| {
+                error!("receiving mongo_rw failed: {:?}", e);
+                nfsstat3::NFS3ERR_SERVERFAULT
+            })?
+            .map(|doc| doc.fattr3(id))
     }
 
     /// Creates a file with the following attributes.
@@ -514,10 +500,7 @@ impl NFSFileSystem for VFSMofuFS {
             "parent": id,
         };
 
-        let sattr3 = sattr3_doc(&attr).map_err(|e| {
-            error!("failed: {:?}", e);
-            nfsstat3::NFS3ERR_IO
-        })?;
+        let sattr3 = sattr3_doc(&attr)?;
 
         let mut insert = doc! {
             "is_dir": false,
