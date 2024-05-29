@@ -396,7 +396,6 @@ impl NFSFileSystem for VFSMofuFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        info!("reading file");
         let (fsid, objid) = match self.id_map.get_fileid(id) {
             Some(FileId::ObjectId(fsid, objid)) => (fsid, objid),
             Some(FileId::FileSystemRoot(_)) | Some(FileId::Root) => {
