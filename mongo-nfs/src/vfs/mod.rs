@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use itertools::Itertools;
-use mongodb::bson::{doc, oid::ObjectId, to_bson, DateTime, Document};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument};
 use nfsserve::nfs::set_uid3;
 use nfsserve::nfs::specdata3;
@@ -408,31 +408,25 @@ impl NFSFileSystem for VFSMofuFS {
 
         let mp = self.mountpoint.get(fsid);
 
-        let attr = mp
-            .db
-            .attributes
-            .find_one(
-                doc! {
-                    "_id": objid,
-                },
-                None,
-            )
+        let (tx, rx) = oneshot::channel();
+        self.tx_mongorw
+            .send(MongoRw::Read {
+                object_id: objid,
+                db: mp.db.clone(),
+                offset,
+                size: count,
+                reply: tx,
+            })
             .await
             .map_err(|e| {
                 error!("failed: {:?}", e);
                 nfsstat3::NFS3ERR_IO
-            })?
-            .ok_or_else(|| {
-                warn!("file not found");
-                nfsstat3::NFS3ERR_NOENT
             })?;
 
-        if attr.is_dir {
-            warn!("attempted to write to a directory");
-            return Err(nfsstat3::NFS3ERR_ISDIR);
-        }
-
-        todo!()
+        rx.await.map_err(|e| {
+            error!("receiving mongo_rw failed: {:?}", e);
+            nfsstat3::NFS3ERR_SERVERFAULT
+        })?
     }
 
     /// Writes the contents of a file returning (bytes, EOF)

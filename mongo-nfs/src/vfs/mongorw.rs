@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use itertools::Itertools;
 use mongodb::bson::oid::ObjectId;
@@ -14,6 +14,13 @@ use crate::db::chunk::LocalChunk;
 use crate::db::MongoDB;
 
 pub enum MongoRw {
+    Read {
+        object_id: ObjectId,
+        db: Arc<MongoDB>,
+        offset: u64,
+        size: u32,
+        reply: oneshot::Sender<Result<(Vec<u8>, bool), nfsstat3>>,
+    },
     Write {
         object_id: ObjectId,
         db: Arc<MongoDB>,
@@ -54,6 +61,11 @@ pub(crate) async fn run_mongorw() -> mpsc::Sender<MongoRw> {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {},
                 msg = rx.recv() => {
                     match msg {
+                        Some(MongoRw::Read { object_id, db, offset, size, reply }) => {
+                            reply.send(read(object_id, db, offset, size, &mut map).await).unwrap_or_else(|e| {
+                                error!("Failed to send reply: {:?}", e);
+                            })
+                        },
                         Some(MongoRw::Write { object_id, db, offset, data, reply }) => {
                             reply.send(write(object_id, db, offset, data, &mut map).await).unwrap_or_else(|e| {
                                 error!("Failed to send reply: {:?}", e);
@@ -80,4 +92,19 @@ async fn write(
     };
     assert_eq!(e.id, object_id);
     e.append(offset, data).await
+}
+
+async fn read(
+    object_id: ObjectId,
+    db: Arc<MongoDB>,
+    offset: u64,
+    size: u32,
+    map: &mut HashMap<ObjectId, LocalChunk>,
+) -> Result<(Vec<u8>, bool), nfsstat3> {
+    let e = match map.entry(object_id) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(e) => e.insert(LocalChunk::new(object_id, db, 256).await?),
+    };
+    assert_eq!(e.id, object_id);
+    e.read(offset, size).await
 }

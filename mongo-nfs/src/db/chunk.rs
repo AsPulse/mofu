@@ -94,6 +94,82 @@ impl LocalChunk {
         })
     }
 
+    pub(crate) async fn read(
+        &mut self,
+        offset: u64,
+        size: u32,
+    ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        let mut data: Vec<u8> = Vec::with_capacity(size.try_into().unwrap());
+
+        self.attr = self
+            .db
+            .attributes
+            .find_one(doc! { "_id": self.id }, None)
+            .await
+            .map_err(|e| {
+                error!("failed: {}", e);
+                nfsstat3::NFS3ERR_IO
+            })?
+            .ok_or_else(|| {
+                error!("failed: not found");
+                nfsstat3::NFS3ERR_IO
+            })?;
+
+        let size_e = min(size as u64, self.attr.size.saturating_sub(offset));
+        let eof = offset + size as u64 >= self.attr.size;
+
+        for (index, dst_start, dst_end, _, _) in split_by_size(
+            offset,
+            size_e as u64,
+            self.update.chunk_size_kb * KB_TO_BYTES,
+        ) {
+            let frag = self.update.fragment.get(&index);
+            if let Some(o) = frag {
+                if o.vec.len() == 1
+                    && o.vec[0].start == 0
+                    && o.vec[0].end == self.update.chunk_size_kb * KB_TO_BYTES
+                {
+                    data.extend(o.vec[0].data[dst_start..dst_end].iter());
+                    continue;
+                }
+            }
+
+            let chunk = self
+                .db
+                .chunks
+                .find_one(
+                    doc! {
+                        "file": self.id,
+                        "index": index as u32
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    error!("failed: {}", e);
+                    nfsstat3::NFS3ERR_IO
+                })?
+                .map(|x| match x.payload {
+                    Bson::Binary(b) => b.bytes,
+                    _ => {
+                        warn!("unexpected payload type");
+                        Vec::new()
+                    }
+                })
+                .unwrap_or_else(|| vec![0; self.update.chunk_size_kb * KB_TO_BYTES]);
+
+            match frag {
+                Some(o) => {
+                    data.extend(o.overlay(chunk)[dst_start..dst_end].iter());
+                }
+                None => {
+                    data.extend(chunk[dst_start..dst_end].iter());
+                }
+            }
+        }
+        Ok((data, eof))
+    }
+
     pub(crate) async fn append(
         &mut self,
         offset: u64,
