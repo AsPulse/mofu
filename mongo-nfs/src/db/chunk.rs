@@ -127,6 +127,11 @@ impl LocalChunk {
         ) {
             let frag = self.update.fragment.get(&index);
             if let Some(o) = frag {
+                if let Some(rx) = self.update.commit.remove(&index) {
+                    if rx.await.is_err() {
+                        warn!("previous-commit is failed.");
+                    }
+                }
                 if o.vec.len() == 1
                     && o.vec[0].start == 0
                     && o.vec[0].end == self.update.chunk_size_kb * KB_TO_BYTES
@@ -214,7 +219,7 @@ impl LocalChunk {
         Ok(self.attr.clone())
     }
 
-    pub(crate) async fn commit(&mut self, index: usize) -> Result<(), nfsstat3> {
+    pub(crate) fn commit(&mut self, index: usize) -> Result<(), nfsstat3> {
         let Some(o) = self.update.fragment.remove(&index) else {
             return Ok(());
         };
@@ -222,7 +227,7 @@ impl LocalChunk {
         let (tx, rx) = oneshot::channel::<()>();
         let rx = self.update.commit.insert(index, rx);
 
-        let (id, db, chunk_size_kb) = (self.id.clone(), self.db.clone(), self.update.chunk_size_kb);
+        let (id, db, chunk_size_kb) = (self.id, self.db.clone(), self.update.chunk_size_kb);
         tokio::spawn(async move {
             if let Some(rx) = rx {
                 if rx.await.is_err() {

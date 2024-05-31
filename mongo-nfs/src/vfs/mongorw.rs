@@ -52,7 +52,7 @@ pub(crate) async fn run_mongorw() -> mpsc::Sender<MongoRw> {
                     .collect_vec();
                 for i in need_flush {
                     info!("Flushing chunk {:?}", i);
-                    chunk.commit(i).await.unwrap_or_else(|e| {
+                    chunk.commit(i).unwrap_or_else(|e| {
                         error!("Failed to flush chunk: {:?}", e);
                     });
                 }
