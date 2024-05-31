@@ -10,6 +10,7 @@ use mongodb::bson::{self, doc, Bson, DateTime};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument, UpdateOptions};
 use nfsserve::nfs::nfsstat3;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use tracing::{error, info, instrument, warn};
 
 use crate::db::attribute::MofuPayload;
@@ -90,6 +91,7 @@ impl LocalChunk {
             update: LocalChunkFragment {
                 chunk_size_kb,
                 fragment: BTreeMap::new(),
+                commit: BTreeMap::new(),
             },
         })
     }
@@ -216,74 +218,92 @@ impl LocalChunk {
         let Some(o) = self.update.fragment.remove(&index) else {
             return Ok(());
         };
-
-        let x = if o.vec.len() == 1
-            && o.vec[0].start == 0
-            && o.vec[0].end == self.update.chunk_size_kb * KB_TO_BYTES
-        {
-            Bson::Binary(bson::Binary {
-                subtype: BinarySubtype::Generic,
-                bytes: o.vec[0].data.clone(),
-            })
-        } else {
-            let data = self
-                .db
-                .chunks
-                .find_one(
-                    doc! {
-                        "file": self.id,
-                        "index": index as u32
-                    },
-                    None,
-                )
-                .await
-                .map_err(|e| {
-                    error!("failed: {}", e);
-                    nfsstat3::NFS3ERR_IO
-                })?
-                .map(|x| match x.payload {
-                    Bson::Binary(b) => b.bytes,
-                    _ => {
-                        warn!("unexpected payload type");
-                        Vec::new()
-                    }
-                })
-                .unwrap_or(Vec::new());
-
-            Bson::Binary(bson::Binary {
-                subtype: BinarySubtype::Generic,
-                bytes: o.overlay(data),
-            })
-        };
-
-        self.db
-            .chunks
-            .update_one(
-                doc! {
-                    "file": self.id,
-                    "index": index as u32
-                },
-                doc! {
-                    "$set": {
-                        "payload": x,
-                        "timestamp": DateTime::now()
-                    }
-                },
-                UpdateOptions::builder().upsert(true).build(),
-            )
-            .await
-            .map_err(|e| {
-                error!("failed: {}", e);
-                nfsstat3::NFS3ERR_IO
-            })?;
+        
+        let (tx, rx) = oneshot::channel::<()>();
+        let rx = self.update.commit.insert(index, rx);
+        
+        let (id, db, chunk_size_kb) = (self.id.clone(), self.db.clone(), self.update.chunk_size_kb);
+        tokio::spawn(async move {
+            commit_task(id, db, chunk_size_kb, index, o).await
+        });
 
         Ok(())
     }
 }
 
+async fn commit_task(
+    id: ObjectId,
+    db: Arc<MongoDB>,
+    chunk_size_kb: usize,
+    index: usize,
+    o: LocalChunkFragmentBy
+) -> Result<(), nfsstat3> {
+    let x = if o.vec.len() == 1
+    && o.vec[0].start == 0
+    && o.vec[0].end == chunk_size_kb * KB_TO_BYTES
+{
+    Bson::Binary(bson::Binary {
+        subtype: BinarySubtype::Generic,
+        bytes: o.vec[0].data.clone(),
+    })
+} else {
+    let data = 
+        db
+        .chunks
+        .find_one(
+            doc! {
+                "file": id,
+                "index": index as u32
+            },
+            None,
+        )
+        .await
+        .map_err(|e| {
+            error!("failed: {}", e);
+            nfsstat3::NFS3ERR_IO
+        })?
+        .map(|x| match x.payload {
+            Bson::Binary(b) => b.bytes,
+            _ => {
+                warn!("unexpected payload type");
+                Vec::new()
+            }
+        })
+        .unwrap_or(Vec::new());
+
+    Bson::Binary(bson::Binary {
+        subtype: BinarySubtype::Generic,
+        bytes: o.overlay(data),
+    })
+};
+
+db
+    .chunks
+    .update_one(
+        doc! {
+            "file": id,
+            "index": index as u32
+        },
+        doc! {
+            "$set": {
+                "payload": x,
+                "timestamp": DateTime::now()
+            }
+        },
+        UpdateOptions::builder().upsert(true).build(),
+    )
+    .await
+    .map_err(|e| {
+        error!("failed: {}", e);
+        nfsstat3::NFS3ERR_IO
+    })?;
+    Ok(())
+}
+
 pub(crate) struct LocalChunkFragment {
     chunk_size_kb: usize,
     pub(crate) fragment: BTreeMap<usize, LocalChunkFragmentBy>,
+    pub(crate) commit: BTreeMap<usize, oneshot::Receiver<()>>,
 }
 
 pub(crate) struct LocalChunkFragmentBy {
