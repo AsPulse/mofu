@@ -1,7 +1,7 @@
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use itertools::Itertools;
 use mongodb::bson::oid::ObjectId;
@@ -35,6 +35,7 @@ pub(crate) struct LocalChunk {
     pub(crate) id: ObjectId,
     pub(crate) db: Arc<MongoDB>,
     attr: MofuAttribute,
+    pub(crate) size_override: Option<u64>,
     pub(crate) update: LocalChunkFragment,
 }
 
@@ -93,6 +94,7 @@ impl LocalChunk {
                 fragment: BTreeMap::new(),
                 commit: BTreeMap::new(),
             },
+            size_override: None,
         })
     }
 
@@ -195,13 +197,65 @@ impl LocalChunk {
             .unwrap_or(0);
 
         if self.attr.size < new_size {
-            info!("updating size {} -> {}", self.attr.size, new_size);
-            self.attr = self
+            self.size_override = Some(new_size);
+        }
+        Ok(self.attr.clone())
+    }
+
+    #[instrument(name = "localchunk/commit", skip(self), fields(id = self.id.to_hex()))]
+    pub(crate) async fn commit_rest(&mut self) -> Result<(), nfsstat3> {
+        let need_flush = self
+            .update
+            .fragment
+            .iter()
+            .filter_map(|(usize, by)| {
+                if by.last_updated.elapsed() > Duration::from_secs(1) {
+                    Some(*usize)
+                } else {
+                    None
+                }
+            })
+            .collect_vec();
+        let len = need_flush.len();
+        let mut task = Vec::with_capacity(len);
+        for i in &need_flush {
+            let Some(o) = self.update.fragment.remove(i) else {
+                break;
+            };
+            let (tx, rx) = oneshot::channel::<()>();
+            let rx = self.update.commit.insert(*i, rx);
+            task.push((*i, o, tx, rx));
+        }
+        if len > 0 {
+            self.attr_commit().await?;
+            info!("{} chunks flush requested.", len);
+            let (id, db, chunk_size_kb) = (self.id, self.db.clone(), self.update.chunk_size_kb);
+            tokio::spawn(async move {
+                for (i, o, tx, rx) in task {
+                    if let Err(e) = commit_task(id, db.clone(), chunk_size_kb, i, o, rx, tx).await {
+                        error!("failed flushing chunk {}: {:?}", i, e);
+                    }
+                }
+                info!("{} chunks flushed.", len);
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn attr_commit(&mut self) -> Result<MofuAttribute, nfsstat3> {
+        self.attr = match self.size_override.take() {
+            Some(size) => self
                 .db
                 .attributes
                 .find_one_and_update(
-                    doc! { "_id": self.id },
-                    doc! { "$set": { "size": u64_to_bson_and_err(new_size)? } },
+                    doc! {
+                        "_id": self.id
+                    },
+                    doc! {
+                        "$set": {
+                            "size": u64_to_bson_and_err(size)?
+                        }
+                    },
                     FindOneAndUpdateOptions::builder()
                         .return_document(ReturnDocument::After)
                         .build(),
@@ -214,34 +268,22 @@ impl LocalChunk {
                 .ok_or_else(|| {
                     error!("failed: not found");
                     nfsstat3::NFS3ERR_IO
-                })?;
-        }
-        Ok(self.attr.clone())
-    }
-
-    pub(crate) fn commit(&mut self, index: usize) -> Result<(), nfsstat3> {
-        let Some(o) = self.update.fragment.remove(&index) else {
-            return Ok(());
+                })?,
+            None => self
+                .db
+                .attributes
+                .find_one(doc! { "_id": self.id }, None)
+                .await
+                .map_err(|e| {
+                    error!("failed: {}", e);
+                    nfsstat3::NFS3ERR_IO
+                })?
+                .ok_or_else(|| {
+                    error!("failed: not found");
+                    nfsstat3::NFS3ERR_IO
+                })?,
         };
-
-        let (tx, rx) = oneshot::channel::<()>();
-        let rx = self.update.commit.insert(index, rx);
-
-        let (id, db, chunk_size_kb) = (self.id, self.db.clone(), self.update.chunk_size_kb);
-        tokio::spawn(async move {
-            if let Some(rx) = rx {
-                if rx.await.is_err() {
-                    warn!("awaiting previous-commit is failed.");
-                }
-            }
-            // nfs側に応答を返せないので仕方がない (ログには残る)
-            let _ = commit_task(id, db, chunk_size_kb, index, o).await;
-            if tx.send(()).is_err() {
-                warn!("previous-commit receiver is dropped.");
-            }
-        });
-
-        Ok(())
+        Ok(self.attr.clone())
     }
 }
 
@@ -251,7 +293,14 @@ async fn commit_task(
     chunk_size_kb: usize,
     index: usize,
     o: LocalChunkFragmentBy,
+    rx: Option<oneshot::Receiver<()>>,
+    tx: oneshot::Sender<()>,
 ) -> Result<(), nfsstat3> {
+    if let Some(rx) = rx {
+        if rx.await.is_err() {
+            warn!("awaiting previous-commit is failed.");
+        }
+    }
     let x =
         if o.vec.len() == 1 && o.vec[0].start == 0 && o.vec[0].end == chunk_size_kb * KB_TO_BYTES {
             Bson::Binary(bson::Binary {
@@ -307,6 +356,9 @@ async fn commit_task(
             error!("failed: {}", e);
             nfsstat3::NFS3ERR_IO
         })?;
+    if tx.send(()).is_err() {
+        warn!("previous-commit receiver is dropped.");
+    }
     Ok(())
 }
 

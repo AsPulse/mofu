@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -325,24 +326,24 @@ impl NFSFileSystem for VFSMofuFS {
             Some(FileId::Root) | Some(FileId::FileSystemRoot(_)) => Ok(generate_default_dir(id)),
             Some(FileId::ObjectId(fs_id, obj_id)) => {
                 let fs = self.mountpoint.get(fs_id);
-                match fs
-                    .db
-                    .attributes
-                    .find_one(
-                        doc! {
-                            "_id": obj_id,
-                        },
-                        None,
-                    )
+                let (tx, rx) = oneshot::channel();
+                self.tx_mongorw
+                    .send(MongoRw::GetAttr {
+                        object_id: obj_id,
+                        db: fs.db.clone(),
+                        reply: tx,
+                    })
                     .await
-                {
-                    Ok(Some(doc)) => Ok(doc.fattr3(id)),
-                    Ok(None) => Err(nfsstat3::NFS3ERR_NOENT),
-                    Err(e) => {
+                    .map_err(|e| {
                         error!("failed: {:?}", e);
-                        Err(nfsstat3::NFS3ERR_IO)
-                    }
-                }
+                        nfsstat3::NFS3ERR_IO
+                    })?;
+                let attr = rx.await.map_err(|e| {
+                    error!("receiving mongo_rw failed: {:?}", e);
+                    nfsstat3::NFS3ERR_SERVERFAULT
+                })??;
+                // info!("getattr: size={:?}", attr.size);
+                Ok(attr.fattr3(id))
             }
             None => Err(nfsstat3::NFS3ERR_NOENT),
         }
@@ -435,6 +436,7 @@ impl NFSFileSystem for VFSMofuFS {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     #[instrument(name = "vfs/write", skip_all, fields(id = %id, offset = %offset, data_len = %data.len()))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        let start = Instant::now();
         let (fsid, objid) = match self.id_map.get_fileid(id) {
             Some(FileId::ObjectId(fsid, objid)) => (fsid, objid),
             Some(FileId::FileSystemRoot(_)) | Some(FileId::Root) => {
@@ -460,12 +462,16 @@ impl NFSFileSystem for VFSMofuFS {
                 nfsstat3::NFS3ERR_IO
             })?;
 
-        rx.await
+        let ret = rx
+            .await
             .map_err(|e| {
                 error!("receiving mongo_rw failed: {:?}", e);
                 nfsstat3::NFS3ERR_SERVERFAULT
             })?
-            .map(|doc| doc.fattr3(id))
+            .map(|doc| doc.fattr3(id));
+
+        info!("write: {:?}", start.elapsed());
+        ret
     }
 
     /// Creates a file with the following attributes.
