@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 use crate::db::attribute::MofuAttribute;
-use crate::db::chunk::LocalChunk;
+use crate::db::chunk::{LocalChunk, LocalChunkCreateError};
 use crate::db::MongoDB;
 
 pub enum MongoRw {
@@ -111,7 +111,11 @@ async fn get_attr(
 ) -> Result<MofuAttribute, nfsstat3> {
     let e = match map.entry(object_id) {
         Entry::Occupied(e) => e.into_mut(),
-        Entry::Vacant(e) => e.insert(LocalChunk::new(object_id, db, 256).await?),
+        Entry::Vacant(e) => match LocalChunk::new(object_id, db, 256).await {
+            Ok(c) => e.insert(c),
+            Err(LocalChunkCreateError::IsDirectory(attr)) => return Ok(attr),
+            Err(LocalChunkCreateError::Error(nfs)) => return Err(nfs),
+        },
     };
     assert_eq!(e.id, object_id);
     e.attr_commit().await
