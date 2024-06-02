@@ -342,7 +342,7 @@ impl NFSFileSystem for VFSMofuFS {
                     error!("receiving mongo_rw failed: {:?}", e);
                     nfsstat3::NFS3ERR_SERVERFAULT
                 })??;
-                // info!("getattr: size={:?}", attr.size);
+                info!("getattr: size={:?}", attr.size);
                 Ok(attr.fattr3(id))
             }
             None => Err(nfsstat3::NFS3ERR_NOENT),
@@ -397,6 +397,7 @@ impl NFSFileSystem for VFSMofuFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        info!("reading file");
         let (fsid, objid) = match self.id_map.get_fileid(id) {
             Some(FileId::ObjectId(fsid, objid)) => (fsid, objid),
             Some(FileId::FileSystemRoot(_)) | Some(FileId::Root) => {
@@ -437,6 +438,7 @@ impl NFSFileSystem for VFSMofuFS {
     #[instrument(name = "vfs/write", skip_all, fields(id = %id, offset = %offset, data_len = %data.len()))]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let start = Instant::now();
+        info!("writing file");
         let (fsid, objid) = match self.id_map.get_fileid(id) {
             Some(FileId::ObjectId(fsid, objid)) => (fsid, objid),
             Some(FileId::FileSystemRoot(_)) | Some(FileId::Root) => {
@@ -447,6 +449,7 @@ impl NFSFileSystem for VFSMofuFS {
         };
 
         let mp = self.mountpoint.get(fsid);
+        let from_tx = Instant::now();
         let (tx, rx) = oneshot::channel();
         self.tx_mongorw
             .send(MongoRw::Write {
@@ -462,6 +465,7 @@ impl NFSFileSystem for VFSMofuFS {
                 nfsstat3::NFS3ERR_IO
             })?;
 
+        let from_rx = Instant::now();
         let ret = rx
             .await
             .map_err(|e| {
@@ -470,7 +474,12 @@ impl NFSFileSystem for VFSMofuFS {
             })?
             .map(|doc| doc.fattr3(id));
 
-        info!("write: {:?}", start.elapsed());
+        info!(
+            "write: {:?}, (tx: {:?}, rx: {:?})",
+            start.elapsed(),
+            from_tx.elapsed(),
+            from_rx.elapsed()
+        );
         ret
     }
 

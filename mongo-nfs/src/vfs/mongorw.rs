@@ -36,7 +36,7 @@ pub enum MongoRw {
 }
 
 pub(crate) async fn run_mongorw() -> mpsc::Sender<MongoRw> {
-    let (tx, mut rx) = mpsc::channel::<MongoRw>(32);
+    let (tx, mut rx) = mpsc::channel::<MongoRw>(1024);
 
     tokio::spawn(async move {
         info!("MongoRw started");
@@ -52,17 +52,19 @@ pub(crate) async fn run_mongorw() -> mpsc::Sender<MongoRw> {
                         Some(MongoRw::GetAttr { object_id, db, reply }) => {
                             reply.send(get_attr(object_id, db, &mut map).await).unwrap_or_else(|e| {
                                 error!("Failed to send reply: {:?}", e);
-                            })
+                            });
                         },
                         Some(MongoRw::Read { object_id, db, offset, size, reply }) => {
                             reply.send(read(object_id, db, offset, size, &mut map).await).unwrap_or_else(|e| {
                                 error!("Failed to send reply: {:?}", e);
-                            })
+                            });
                         },
                         Some(MongoRw::Write { object_id, db, offset, data, reply }) => {
+                            // info!("Write request: {:?}", object_id);
                             reply.send(write(object_id, db, offset, data, &mut map).await).unwrap_or_else(|e| {
                                 error!("Failed to send reply: {:?}", e);
-                            })
+                            });
+                            // info!("Write request done: {:?}", object_id);
                         },
                         None => break,
                     }

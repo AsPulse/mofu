@@ -35,6 +35,7 @@ pub(crate) struct LocalChunk {
     pub(crate) id: ObjectId,
     pub(crate) db: Arc<MongoDB>,
     attr: MofuAttribute,
+    last_attr: Instant,
     pub(crate) size_override: Option<u64>,
     pub(crate) update: LocalChunkFragment,
 }
@@ -94,6 +95,7 @@ impl LocalChunk {
                 fragment: BTreeMap::new(),
                 commit: BTreeMap::new(),
             },
+            last_attr: Instant::now(),
             size_override: None,
         })
     }
@@ -269,20 +271,26 @@ impl LocalChunk {
                     error!("failed: not found");
                     nfsstat3::NFS3ERR_IO
                 })?,
-            None => self
-                .db
-                .attributes
-                .find_one(doc! { "_id": self.id }, None)
-                .await
-                .map_err(|e| {
-                    error!("failed: {}", e);
-                    nfsstat3::NFS3ERR_IO
-                })?
-                .ok_or_else(|| {
-                    error!("failed: not found");
-                    nfsstat3::NFS3ERR_IO
-                })?,
+            None => {
+                if self.last_attr.elapsed() <= Duration::from_secs(3) {
+                    self.attr.clone()
+                } else {
+                    self.db
+                        .attributes
+                        .find_one(doc! { "_id": self.id }, None)
+                        .await
+                        .map_err(|e| {
+                            error!("failed: {}", e);
+                            nfsstat3::NFS3ERR_IO
+                        })?
+                        .ok_or_else(|| {
+                            error!("failed: not found");
+                            nfsstat3::NFS3ERR_IO
+                        })?
+                }
+            }
         };
+        self.last_attr = Instant::now();
         Ok(self.attr.clone())
     }
 }
