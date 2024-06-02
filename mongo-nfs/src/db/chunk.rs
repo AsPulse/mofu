@@ -10,6 +10,7 @@ use mongodb::bson::{self, doc, Bson, DateTime};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument, UpdateOptions};
 use nfsserve::nfs::nfsstat3;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{error, info, instrument, warn};
 
@@ -40,13 +41,38 @@ pub(crate) struct LocalChunk {
     pub(crate) update: LocalChunkFragment,
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum LocalChunkCreateError {
+    #[error("given id is a directory")]
+    IsDirectory(MofuAttribute),
+    #[error("failed to create new chunk")]
+    Error(nfsstat3),
+}
+impl From<nfsstat3> for LocalChunkCreateError {
+    fn from(e: nfsstat3) -> Self {
+        LocalChunkCreateError::Error(e)
+    }
+}
+
+impl From<LocalChunkCreateError> for nfsstat3 {
+    fn from(e: LocalChunkCreateError) -> Self {
+        match e {
+            LocalChunkCreateError::IsDirectory(_) => {
+                warn!("given id is a directory");
+                nfsstat3::NFS3ERR_ISDIR
+            }
+            LocalChunkCreateError::Error(e) => e,
+        }
+    }
+}
+
 impl LocalChunk {
     #[instrument(name = "localchunk/new", skip(db))]
     pub(crate) async fn new(
         id: ObjectId,
         db: Arc<MongoDB>,
         default_chunk_size_kb: usize,
-    ) -> Result<Self, nfsstat3> {
+    ) -> Result<Self, LocalChunkCreateError> {
         // TODO: check it is not a directory
         let mut attr = db
             .attributes
@@ -58,8 +84,11 @@ impl LocalChunk {
             })?
             .ok_or_else(|| {
                 error!("failed: not found");
-                nfsstat3::NFS3ERR_IO
+                nfsstat3::NFS3ERR_NOENT
             })?;
+        if attr.is_dir {
+            return Err(LocalChunkCreateError::IsDirectory(attr));
+        }
 
         if attr.payload.is_none() {
             warn!("chunk payload is not found, creating new one");
@@ -118,7 +147,7 @@ impl LocalChunk {
             })?
             .ok_or_else(|| {
                 error!("failed: not found");
-                nfsstat3::NFS3ERR_IO
+                nfsstat3::NFS3ERR_NOENT
             })?;
 
         let size_e = min(size as u64, self.attr.size.saturating_sub(offset));
@@ -269,7 +298,7 @@ impl LocalChunk {
                 })?
                 .ok_or_else(|| {
                     error!("failed: not found");
-                    nfsstat3::NFS3ERR_IO
+                    nfsstat3::NFS3ERR_NOENT
                 })?,
             None => {
                 if self.last_attr.elapsed() <= Duration::from_secs(3) {
@@ -285,7 +314,7 @@ impl LocalChunk {
                         })?
                         .ok_or_else(|| {
                             error!("failed: not found");
-                            nfsstat3::NFS3ERR_IO
+                            nfsstat3::NFS3ERR_NOENT
                         })?
                 }
             }

@@ -221,7 +221,6 @@ impl VFSMofuFS {
         fs_id: MountpointId,
         name: String,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let id = ObjectId::new();
         let doc = MofuAttribute {
             _id: None,
             parent,
@@ -238,10 +237,18 @@ impl VFSMofuFS {
             timestamp: DateTime::now(),
         };
 
-        db.attributes.insert_one(&doc, None).await.map_err(|e| {
-            error!("failed: {:?}", e);
-            nfsstat3::NFS3ERR_IO
-        })?;
+        let id = db
+            .attributes
+            .insert_one(&doc, None)
+            .await
+            .map_err(|e| {
+                error!("failed: {:?}", e);
+                nfsstat3::NFS3ERR_IO
+            })?
+            .inserted_id
+            .as_object_id()
+            .unwrap();
+
         let id = self
             .id_map
             .get_fileid_or_insert(FileId::ObjectId(fs_id, id));
