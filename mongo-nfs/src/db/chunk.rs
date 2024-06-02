@@ -1,7 +1,7 @@
 use std::cmp::min;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use itertools::Itertools;
 use mongodb::bson::oid::ObjectId;
@@ -10,6 +10,7 @@ use mongodb::bson::{self, doc, Bson, DateTime};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument, UpdateOptions};
 use nfsserve::nfs::nfsstat3;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 use tracing::{error, info, instrument, warn};
 
 use crate::db::attribute::MofuPayload;
@@ -34,6 +35,8 @@ pub(crate) struct LocalChunk {
     pub(crate) id: ObjectId,
     pub(crate) db: Arc<MongoDB>,
     attr: MofuAttribute,
+    last_attr: Instant,
+    pub(crate) size_override: Option<u64>,
     pub(crate) update: LocalChunkFragment,
 }
 
@@ -90,7 +93,10 @@ impl LocalChunk {
             update: LocalChunkFragment {
                 chunk_size_kb,
                 fragment: BTreeMap::new(),
+                commit: BTreeMap::new(),
             },
+            last_attr: Instant::now(),
+            size_override: None,
         })
     }
 
@@ -125,6 +131,11 @@ impl LocalChunk {
         ) {
             let frag = self.update.fragment.get(&index);
             if let Some(o) = frag {
+                if let Some(rx) = self.update.commit.remove(&index) {
+                    if rx.await.is_err() {
+                        warn!("previous-commit is failed.");
+                    }
+                }
                 if o.vec.len() == 1
                     && o.vec[0].start == 0
                     && o.vec[0].end == self.update.chunk_size_kb * KB_TO_BYTES
@@ -188,13 +199,65 @@ impl LocalChunk {
             .unwrap_or(0);
 
         if self.attr.size < new_size {
-            info!("updating size {} -> {}", self.attr.size, new_size);
-            self.attr = self
+            self.size_override = Some(new_size);
+        }
+        Ok(self.attr.clone())
+    }
+
+    #[instrument(name = "localchunk/commit", skip(self), fields(id = self.id.to_hex()))]
+    pub(crate) async fn commit_rest(&mut self) -> Result<(), nfsstat3> {
+        let need_flush = self
+            .update
+            .fragment
+            .iter()
+            .filter_map(|(usize, by)| {
+                if by.last_updated.elapsed() > Duration::from_secs(1) {
+                    Some(*usize)
+                } else {
+                    None
+                }
+            })
+            .collect_vec();
+        let len = need_flush.len();
+        let mut task = Vec::with_capacity(len);
+        for i in &need_flush {
+            let Some(o) = self.update.fragment.remove(i) else {
+                break;
+            };
+            let (tx, rx) = oneshot::channel::<()>();
+            let rx = self.update.commit.insert(*i, rx);
+            task.push((*i, o, tx, rx));
+        }
+        if len > 0 {
+            self.attr_commit().await?;
+            info!("{} chunks flush requested.", len);
+            let (id, db, chunk_size_kb) = (self.id, self.db.clone(), self.update.chunk_size_kb);
+            tokio::spawn(async move {
+                for (i, o, tx, rx) in task {
+                    if let Err(e) = commit_task(id, db.clone(), chunk_size_kb, i, o, rx, tx).await {
+                        error!("failed flushing chunk {}: {:?}", i, e);
+                    }
+                }
+                info!("{} chunks flushed.", len);
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn attr_commit(&mut self) -> Result<MofuAttribute, nfsstat3> {
+        self.attr = match self.size_override.take() {
+            Some(size) => self
                 .db
                 .attributes
                 .find_one_and_update(
-                    doc! { "_id": self.id },
-                    doc! { "$set": { "size": u64_to_bson_and_err(new_size)? } },
+                    doc! {
+                        "_id": self.id
+                    },
+                    doc! {
+                        "$set": {
+                            "size": u64_to_bson_and_err(size)?
+                        }
+                    },
                     FindOneAndUpdateOptions::builder()
                         .return_document(ReturnDocument::After)
                         .build(),
@@ -207,31 +270,57 @@ impl LocalChunk {
                 .ok_or_else(|| {
                     error!("failed: not found");
                     nfsstat3::NFS3ERR_IO
-                })?;
-        }
+                })?,
+            None => {
+                if self.last_attr.elapsed() <= Duration::from_secs(3) {
+                    self.attr.clone()
+                } else {
+                    self.db
+                        .attributes
+                        .find_one(doc! { "_id": self.id }, None)
+                        .await
+                        .map_err(|e| {
+                            error!("failed: {}", e);
+                            nfsstat3::NFS3ERR_IO
+                        })?
+                        .ok_or_else(|| {
+                            error!("failed: not found");
+                            nfsstat3::NFS3ERR_IO
+                        })?
+                }
+            }
+        };
+        self.last_attr = Instant::now();
         Ok(self.attr.clone())
     }
+}
 
-    pub(crate) async fn commit(&mut self, index: usize) -> Result<(), nfsstat3> {
-        let Some(o) = self.update.fragment.remove(&index) else {
-            return Ok(());
-        };
-
-        let x = if o.vec.len() == 1
-            && o.vec[0].start == 0
-            && o.vec[0].end == self.update.chunk_size_kb * KB_TO_BYTES
-        {
+async fn commit_task(
+    id: ObjectId,
+    db: Arc<MongoDB>,
+    chunk_size_kb: usize,
+    index: usize,
+    o: LocalChunkFragmentBy,
+    rx: Option<oneshot::Receiver<()>>,
+    tx: oneshot::Sender<()>,
+) -> Result<(), nfsstat3> {
+    if let Some(rx) = rx {
+        if rx.await.is_err() {
+            warn!("awaiting previous-commit is failed.");
+        }
+    }
+    let x =
+        if o.vec.len() == 1 && o.vec[0].start == 0 && o.vec[0].end == chunk_size_kb * KB_TO_BYTES {
             Bson::Binary(bson::Binary {
                 subtype: BinarySubtype::Generic,
                 bytes: o.vec[0].data.clone(),
             })
         } else {
-            let data = self
-                .db
+            let data = db
                 .chunks
                 .find_one(
                     doc! {
-                        "file": self.id,
+                        "file": id,
                         "index": index as u32
                     },
                     None,
@@ -256,34 +345,35 @@ impl LocalChunk {
             })
         };
 
-        self.db
-            .chunks
-            .update_one(
-                doc! {
-                    "file": self.id,
-                    "index": index as u32
-                },
-                doc! {
-                    "$set": {
-                        "payload": x,
-                        "timestamp": DateTime::now()
-                    }
-                },
-                UpdateOptions::builder().upsert(true).build(),
-            )
-            .await
-            .map_err(|e| {
-                error!("failed: {}", e);
-                nfsstat3::NFS3ERR_IO
-            })?;
-
-        Ok(())
+    db.chunks
+        .update_one(
+            doc! {
+                "file": id,
+                "index": index as u32
+            },
+            doc! {
+                "$set": {
+                    "payload": x,
+                    "timestamp": DateTime::now()
+                }
+            },
+            UpdateOptions::builder().upsert(true).build(),
+        )
+        .await
+        .map_err(|e| {
+            error!("failed: {}", e);
+            nfsstat3::NFS3ERR_IO
+        })?;
+    if tx.send(()).is_err() {
+        warn!("previous-commit receiver is dropped.");
     }
+    Ok(())
 }
 
 pub(crate) struct LocalChunkFragment {
     chunk_size_kb: usize,
     pub(crate) fragment: BTreeMap<usize, LocalChunkFragmentBy>,
+    pub(crate) commit: BTreeMap<usize, oneshot::Receiver<()>>,
 }
 
 pub(crate) struct LocalChunkFragmentBy {

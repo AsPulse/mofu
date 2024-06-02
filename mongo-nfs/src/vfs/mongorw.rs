@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use itertools::Itertools;
 use mongodb::bson::oid::ObjectId;
@@ -14,6 +14,11 @@ use crate::db::chunk::LocalChunk;
 use crate::db::MongoDB;
 
 pub enum MongoRw {
+    GetAttr {
+        object_id: ObjectId,
+        db: Arc<MongoDB>,
+        reply: oneshot::Sender<Result<MofuAttribute, nfsstat3>>,
+    },
     Read {
         object_id: ObjectId,
         db: Arc<MongoDB>,
@@ -31,45 +36,35 @@ pub enum MongoRw {
 }
 
 pub(crate) async fn run_mongorw() -> mpsc::Sender<MongoRw> {
-    let (tx, mut rx) = mpsc::channel::<MongoRw>(32);
+    let (tx, mut rx) = mpsc::channel::<MongoRw>(1024);
 
     tokio::spawn(async move {
         info!("MongoRw started");
         let mut map = HashMap::<ObjectId, LocalChunk>::new();
         loop {
             for (_, chunk) in map.iter_mut() {
-                let need_flush = chunk
-                    .update
-                    .fragment
-                    .iter()
-                    .filter_map(|(usize, by)| {
-                        if by.last_updated.elapsed() > Duration::from_secs(1) {
-                            Some(*usize)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect_vec();
-                for i in need_flush {
-                    info!("Flushing chunk {:?}", i);
-                    chunk.commit(i).await.unwrap_or_else(|e| {
-                        error!("Failed to flush chunk: {:?}", e);
-                    });
-                }
+                let _ = chunk.commit_rest().await;
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {},
                 msg = rx.recv() => {
                     match msg {
+                        Some(MongoRw::GetAttr { object_id, db, reply }) => {
+                            reply.send(get_attr(object_id, db, &mut map).await).unwrap_or_else(|e| {
+                                error!("Failed to send reply: {:?}", e);
+                            });
+                        },
                         Some(MongoRw::Read { object_id, db, offset, size, reply }) => {
                             reply.send(read(object_id, db, offset, size, &mut map).await).unwrap_or_else(|e| {
                                 error!("Failed to send reply: {:?}", e);
-                            })
+                            });
                         },
                         Some(MongoRw::Write { object_id, db, offset, data, reply }) => {
+                            // info!("Write request: {:?}", object_id);
                             reply.send(write(object_id, db, offset, data, &mut map).await).unwrap_or_else(|e| {
                                 error!("Failed to send reply: {:?}", e);
-                            })
+                            });
+                            // info!("Write request done: {:?}", object_id);
                         },
                         None => break,
                     }
@@ -107,4 +102,17 @@ async fn read(
     };
     assert_eq!(e.id, object_id);
     e.read(offset, size).await
+}
+
+async fn get_attr(
+    object_id: ObjectId,
+    db: Arc<MongoDB>,
+    map: &mut HashMap<ObjectId, LocalChunk>,
+) -> Result<MofuAttribute, nfsstat3> {
+    let e = match map.entry(object_id) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(e) => e.insert(LocalChunk::new(object_id, db, 256).await?),
+    };
+    assert_eq!(e.id, object_id);
+    e.attr_commit().await
 }
